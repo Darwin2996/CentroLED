@@ -11,8 +11,13 @@ App nativa de Windows (Rust + Win32, ~310 KB) para controlar las luces y ver la 
 | Mando DualShock 4 | Sí | Barra de luz (mismos efectos) |
 | Logitech HID++ (G733 y otros cascos/ratones/teclados) | Sí | Cada zona de luz por separado (p. ej. las dos luces del G733) con los efectos que admita el dispositivo: estático, respiración, pulso, ciclo de color, ondas… |
 | Ratones VXE / ATK (receptor 2.4 GHz) | Sí, si el ratón está despierto (si duerme se muestra el último valor) | — |
-| Mandos Xbox (XInput) | Aproximada | — |
-| Cualquier dispositivo Bluetooth que informe batería a Windows | Sí | — |
+| Mandos Xbox (One, Series X\|S, Elite, 360 y compatibles) | Sí (exacta por Bluetooth, aproximada por adaptador/USB); también la de los cascos Xbox conectados al mando | — |
+| Mando Pro de Switch, Joy-Con y mando SNES | Sí (aproximada, por Bluetooth) | LEDs de jugador y luz del botón Home |
+| Cascos SteelSeries Arctis 1, 7, 7+, 9, Nova 5, Nova 7 y Nova Pro Wireless | Sí | — |
+| Cascos HyperX Cloud Alpha Wireless, Cloud Flight y Cloud II Wireless | Sí | — |
+| Cascos Corsair Void (y variantes) | Sí | — |
+| Cualquier dispositivo Bluetooth que informe batería a Windows (cascos, ratones, teclados, mandos, relojes…) | Sí | — |
+| **Todo lo que soporta [OpenRGB](https://openrgb.org)**: placas base, RAM, gráficas, ventiladores, tiras LED, Razer, Corsair… | — | Color fijo o apagado (OpenRGB abierto con su *SDK Server* activado) |
 
 Las luces de mandos y cascos se pierden al desconectarlos; la app las vuelve a aplicar sola (o reanuda el ciclo) cuando se reconectan.
 
@@ -33,6 +38,10 @@ Línea de comandos (para scripts):
 CentroLED.exe --probe salida.txt
 CentroLED.exe --set <clave> <modo|off> <rrggbb> <brillo 0-100> <velocidad 0-100> salida.txt
 ```
+
+## OpenRGB
+
+Para controlar las luces de componentes del PC (placa base, RAM, gráfica…) y de cientos de periféricos más, instala [OpenRGB](https://openrgb.org), abre la pestaña **SDK Server** y pulsa **Start Server** (puedes activar que arranque minimizado con el servidor). Centro LED se conecta a él en `localhost:6742` y muestra sus dispositivos en la lista.
 
 ## Límites del teclado
 
@@ -63,3 +72,7 @@ Para publicar una versión nueva: sube `version` en `Cargo.toml`, compila y crea
 ```
 cargo build --release
 ```
+
+## Créditos
+
+Los protocolos de batería de cascos de otras marcas se basan en [HeadsetControl](https://github.com/Sapd/HeadsetControl) y los de los mandos de Switch en el controlador *hid-nintendo* de Linux.

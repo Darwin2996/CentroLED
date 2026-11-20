@@ -3,6 +3,9 @@
 //! La interfaz se dibuja a mano con GDI (sin controles estándar ni motores web).
 
 mod devices;
+mod headsets;
+mod nintendo;
+mod openrgb;
 mod hid;
 mod kb_layout;
 mod kb_template;
@@ -528,7 +531,11 @@ fn select_device(i: usize) {
     let nz = d.led.as_ref().map(|l| l.zones.len()).unwrap_or(0);
     let cur = a.cur;
     a.zones = (0..nz).map(|i| a.config.led.get(&format!("{}#z{}", d.key, i)).copied().unwrap_or(cur)).collect();
-    a.pad = a.config.pads.get(&d.key).copied().unwrap_or_default();
+    a.pad = a.config.pads.get(&d.key).copied().unwrap_or(if matches!(d.driver, devices::Driver::Switch { .. }) {
+        PadExtra { player: 0b0001, player_bright: 2, mic: 0 }
+    } else {
+        PadExtra::default()
+    });
     redraw();
 }
 
@@ -765,7 +772,11 @@ fn glyph(d: &Device) -> &'static str {
         "Lápiz" => "\u{EDC6}",
         "Reloj" => "\u{E916}",
         "Móvil" => "\u{E8EA}",
-        "Placa base" => "\u{E950}",
+        "Placa base" | "Memoria RAM" | "Gráfica" | "Refrigeración" | "Caja" | "Almacenamiento" => "\u{E950}",
+        "Tira LED" | "Luz" | "RGB" => "\u{E781}",
+        "Altavoz" => "\u{E7F5}",
+        "Micrófono" => "\u{E720}",
+        "Alfombrilla" => "\u{E962}",
         _ => "\u{E772}",
     }
 }
@@ -1023,108 +1034,114 @@ fn paint_device(p: &Painter, d: &Device, x: i32, w: i32) {
         y = paint_device_hero(p, d, x, y, w) + 18;
     }
 
-    // Efectos
-    let rim_tab = keyboard && a.tab == 1;
-    let modes: Vec<(&str, u8)> = if rim_tab { RIM_MODES.to_vec() } else { caps.modes.clone() };
-    let e = *editing();
-    section(p, if keyboard { "EFECTO · LA VISTA PREVIA DE ARRIBA ES APROXIMADA" } else { "EFECTO" }, x, y);
-    y += 22;
-    let mut cx = x;
-    for (name, id) in modes {
-        let tw = p.measure(name, a.fonts.body) + 28;
-        if cx + tw > x + w {
-            cx = x;
-            y += 38;
-        }
-        let r = p.rect(cx, y, tw, 30);
-        let on = e.mode == id;
-        p.fill(&r, if on { ACCENT } else if is_hot(Act::Mode(id)) { CARD_HOT } else { CARD }, 15);
-        p.text(name, &r, if on { TEXT } else { mix(SUB, TEXT, 0.5) }, a.fonts.body, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        hit(r, Act::Mode(id));
-        cx += tw + 8;
-    }
-    y += 50;
-
-    // Color
-    let custom = !rim_tab && keyboard && e.mode == MODE_CUSTOM;
-    let cycle = !keyboard && cycle_editing();
-    if cycle {
-        // Lista de colores del ciclo (clic para quitar)
-        section(p, &format!("COLORES DEL CICLO ({}/{}) · CLIC EN UNO PARA QUITARLO", a.cycle.len(), MAX_CYCLE), x, y);
+    let switch = matches!(d.driver, devices::Driver::Switch { .. });
+    let custom = !switch && keyboard && a.tab == 0 && editing().mode == MODE_CUSTOM;
+    if switch {
+        paint_pad_extras(p, x, y, w, true);
+    } else {
+        // Efectos
+        let rim_tab = keyboard && a.tab == 1;
+        let modes: Vec<(&str, u8)> = if rim_tab { RIM_MODES.to_vec() } else { caps.modes.clone() };
+        let e = *editing();
+        section(p, if keyboard { "EFECTO · LA VISTA PREVIA DE ARRIBA ES APROXIMADA" } else { "EFECTO" }, x, y);
         y += 22;
         let mut cx = x;
-        for (i, c) in a.cycle.iter().enumerate() {
-            let r = p.rect(cx, y, 34, 34);
-            p.circle(&r, to_ref(*c), Some((TEXT, 2)));
-            if is_hot(Act::CycleRemove(i)) {
-                p.circle(&r, mix(to_ref(*c), BG, 0.55), Some((TEXT, 2)));
-                p.text("×", &r, TEXT, a.fonts.h2, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        for (name, id) in modes {
+            let tw = p.measure(name, a.fonts.body) + 28;
+            if cx + tw > x + w {
+                cx = x;
+                y += 38;
             }
-            hit(r, Act::CycleRemove(i));
-            if i + 1 < a.cycle.len() {
-                p.text("›", &p.rect(cx + 34, y, 18, 34), SUB, a.fonts.h2, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            }
-            cx += 52;
-        }
-        if a.cycle.len() < 2 {
-            p.text("Añade al menos 2 colores", &p.rect(cx, y, 300, 34), AMBER, a.fonts.body, DT_SINGLELINE | DT_VCENTER);
-        }
-        y += 50;
-    }
-    let no_color = matches!(e.mode, MODE_SW_RAINBOW | MODE_OFF) || (!keyboard && matches!(e.mode, 0x03 | 0x0E));
-    if no_color {
-        section(p, "COLOR", x, y);
-        p.text("Este efecto recorre todos los colores por sí mismo.", &p.rect(x, y + 22, w, 30), SUB, a.fonts.body, DT_SINGLELINE | DT_VCENTER);
-    }
-    section(p, if no_color { "" } else if custom { "COLOR DEL PINCEL" } else if cycle { "AÑADIR COLOR" } else { "COLOR" }, x, y);
-    y += 22;
-    let mut cx = x;
-    for c in if no_color { &[][..] } else { &PALETTE[..] } {
-        let c = *c;
-        let r = p.rect(cx, y, 30, 30);
-        let current = !cycle && !e.multi && [e.rgb.0, e.rgb.1, e.rgb.2] == c;
-        if current || is_hot(Act::Color(c)) {
-            p.circle(&p.rect(cx - 4, y - 4, 38, 38), BG, Some((if current { TEXT } else { SUB }, 2)));
-        }
-        p.circle(&r, to_ref(c), None);
-        hit(r, Act::Color(c));
-        cx += 40;
-    }
-    // Color libre
-    let r = if no_color { RECT { left: 0, top: 0, right: 0, bottom: 0 } } else { p.rect(cx, y, 30, 30) };
-    let in_palette = cycle || PALETTE.contains(&[e.rgb.0, e.rgb.1, e.rgb.2]);
-    if !no_color {
-        p.circle(&r, if in_palette { CARD } else { rgb(e.rgb.0, e.rgb.1, e.rgb.2) }, Some((if is_hot(Act::MoreColors) { TEXT } else { SUB }, 2)));
-        if in_palette {
-            p.text("+", &r, TEXT, a.fonts.h2, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        }
-        hit(r, Act::MoreColors);
-    }
-    cx += 52;
-    if custom {
-        for (label, act) in [("Rellenar todo", Act::FillAll), ("Apagar todo", Act::ClearAll)] {
-            let tw = p.measure(label, a.fonts.body) + 28;
             let r = p.rect(cx, y, tw, 30);
-            p.fill(&r, if is_hot(act) { CARD_HOT } else { CARD }, 8);
-            p.text(label, &r, TEXT, a.fonts.body, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            hit(r, act);
+            let on = e.mode == id;
+            p.fill(&r, if on { ACCENT } else if is_hot(Act::Mode(id)) { CARD_HOT } else { CARD }, 15);
+            p.text(name, &r, if on { TEXT } else { mix(SUB, TEXT, 0.5) }, a.fonts.body, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            hit(r, Act::Mode(id));
             cx += tw + 8;
         }
-    } else if caps.multicolor || rim_tab {
-        paint_switch(p, cx, y + 5, e.multi, Act::Multi);
-        p.text("Arcoíris", &p.rect(cx + 46, y, 100, 30), SUB, a.fonts.body, DT_SINGLELINE | DT_VCENTER);
-    }
-    y += 48;
+        y += 50;
 
-    // Brillo / velocidad
-    let half = (w - 40) / 2;
-    paint_slider(p, "Brillo", e.bright, x, y, half, 0, true);
-    let speed_on = caps.speed && !custom && !matches!(e.mode, 1 | 24 | 25 | MODE_OFF);
-    let speed_label = if cycle { "Velocidad del ciclo" } else { "Velocidad" };
-    paint_slider(p, speed_label, e.speed, x + half + 40, y, half, 1, speed_on);
-    y += 62;
-    if caps.pad_extras {
-        paint_pad_extras(p, x, y, w);
+        // Color
+        let custom = !rim_tab && keyboard && e.mode == MODE_CUSTOM;
+        let cycle = !keyboard && cycle_editing();
+        if cycle {
+            // Lista de colores del ciclo (clic para quitar)
+            section(p, &format!("COLORES DEL CICLO ({}/{}) · CLIC EN UNO PARA QUITARLO", a.cycle.len(), MAX_CYCLE), x, y);
+            y += 22;
+            let mut cx = x;
+            for (i, c) in a.cycle.iter().enumerate() {
+                let r = p.rect(cx, y, 34, 34);
+                p.circle(&r, to_ref(*c), Some((TEXT, 2)));
+                if is_hot(Act::CycleRemove(i)) {
+                    p.circle(&r, mix(to_ref(*c), BG, 0.55), Some((TEXT, 2)));
+                    p.text("×", &r, TEXT, a.fonts.h2, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                }
+                hit(r, Act::CycleRemove(i));
+                if i + 1 < a.cycle.len() {
+                    p.text("›", &p.rect(cx + 34, y, 18, 34), SUB, a.fonts.h2, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                }
+                cx += 52;
+            }
+            if a.cycle.len() < 2 {
+                p.text("Añade al menos 2 colores", &p.rect(cx, y, 300, 34), AMBER, a.fonts.body, DT_SINGLELINE | DT_VCENTER);
+            }
+            y += 50;
+        }
+        let no_color = matches!(e.mode, MODE_SW_RAINBOW | MODE_OFF) || (!keyboard && matches!(e.mode, 0x03 | 0x0E));
+        if no_color {
+            section(p, "COLOR", x, y);
+            p.text("Este efecto recorre todos los colores por sí mismo.", &p.rect(x, y + 22, w, 30), SUB, a.fonts.body, DT_SINGLELINE | DT_VCENTER);
+        }
+        section(p, if no_color { "" } else if custom { "COLOR DEL PINCEL" } else if cycle { "AÑADIR COLOR" } else { "COLOR" }, x, y);
+        y += 22;
+        let mut cx = x;
+        for c in if no_color { &[][..] } else { &PALETTE[..] } {
+            let c = *c;
+            let r = p.rect(cx, y, 30, 30);
+            let current = !cycle && !e.multi && [e.rgb.0, e.rgb.1, e.rgb.2] == c;
+            if current || is_hot(Act::Color(c)) {
+                p.circle(&p.rect(cx - 4, y - 4, 38, 38), BG, Some((if current { TEXT } else { SUB }, 2)));
+            }
+            p.circle(&r, to_ref(c), None);
+            hit(r, Act::Color(c));
+            cx += 40;
+        }
+        // Color libre
+        let r = if no_color { RECT { left: 0, top: 0, right: 0, bottom: 0 } } else { p.rect(cx, y, 30, 30) };
+        let in_palette = cycle || PALETTE.contains(&[e.rgb.0, e.rgb.1, e.rgb.2]);
+        if !no_color {
+            p.circle(&r, if in_palette { CARD } else { rgb(e.rgb.0, e.rgb.1, e.rgb.2) }, Some((if is_hot(Act::MoreColors) { TEXT } else { SUB }, 2)));
+            if in_palette {
+                p.text("+", &r, TEXT, a.fonts.h2, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
+            hit(r, Act::MoreColors);
+        }
+        cx += 52;
+        if custom {
+            for (label, act) in [("Rellenar todo", Act::FillAll), ("Apagar todo", Act::ClearAll)] {
+                let tw = p.measure(label, a.fonts.body) + 28;
+                let r = p.rect(cx, y, tw, 30);
+                p.fill(&r, if is_hot(act) { CARD_HOT } else { CARD }, 8);
+                p.text(label, &r, TEXT, a.fonts.body, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                hit(r, act);
+                cx += tw + 8;
+            }
+        } else if caps.multicolor || rim_tab {
+            paint_switch(p, cx, y + 5, e.multi, Act::Multi);
+            p.text("Arcoíris", &p.rect(cx + 46, y, 100, 30), SUB, a.fonts.body, DT_SINGLELINE | DT_VCENTER);
+        }
+        y += 48;
+
+        // Brillo / velocidad
+        let half = (w - 40) / 2;
+        paint_slider(p, "Brillo", e.bright, x, y, half, 0, true);
+        let speed_on = caps.speed && !custom && !matches!(e.mode, 1 | 24 | 25 | MODE_OFF);
+        let speed_label = if cycle { "Velocidad del ciclo" } else { "Velocidad" };
+        paint_slider(p, speed_label, e.speed, x + half + 40, y, half, 1, speed_on);
+        y += 62;
+        if caps.pad_extras {
+            paint_pad_extras(p, x, y, w, false);
+        }
     }
 
     // Barra inferior: estado + aplicar
@@ -1143,9 +1160,35 @@ fn paint_device(p: &Painter, d: &Device, x: i32, w: i32) {
     hit(ar, Act::Apply);
 }
 
-/// LEDs de jugador (5) con su brillo y LED del micrófono del DualSense.
-fn paint_pad_extras(p: &Painter, x: i32, y: i32, w: i32) {
+/// LEDs de jugador con su brillo y LED del micrófono (DualSense), o LEDs de jugador y
+/// luz del botón Home (mandos de Switch).
+fn paint_pad_extras(p: &Painter, x: i32, y: i32, w: i32, switch: bool) {
     let a = app();
+    if switch {
+        section(p, "LEDS DE JUGADOR · CLIC PARA ENCENDER O APAGAR", x, y);
+        section(p, "LUZ DEL BOTÓN HOME (MANDO PRO Y JOY-CON D)", x + w / 2 + 20, y);
+        let y = y + 22;
+        for i in 0..4u8 {
+            let on = a.pad.player & (1 << i) != 0;
+            let r = p.rect(x + i as i32 * 30, y + 9, 14, 14);
+            p.fill(&r, if on { rgb(0x6C, 0xF0, 0x5A) } else { LINE }, 7);
+            if is_hot(Act::PlayerLed(i)) {
+                p.stroke(&r, ACCENT, 7, 2);
+            }
+            hit(p.rect(x + i as i32 * 30 - 6, y, 28, 32), Act::PlayerLed(i));
+        }
+        let mut cx = x + w / 2 + 20;
+        for (n, label) in ["Apagada", "Baja", "Media", "Máxima"].iter().enumerate() {
+            let tw = p.measure(label, a.fonts.small) + 20;
+            let r = p.rect(cx, y + 2, tw, 26);
+            let on = a.pad.player_bright == n as u8;
+            p.fill(&r, if on { ACCENT } else if is_hot(Act::PlayerBright(n as u8)) { CARD_HOT } else { CARD }, 13);
+            p.text(label, &r, if on { TEXT } else { mix(SUB, TEXT, 0.5) }, a.fonts.small, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            hit(r, Act::PlayerBright(n as u8));
+            cx += tw + 6;
+        }
+        return;
+    }
     section(p, "LEDS DE JUGADOR · CLIC PARA ENCENDER O APAGAR", x, y);
     section(p, "LED DEL MICRÓFONO", x + w / 2 + 20, y);
     let y = y + 22;
@@ -1502,6 +1545,12 @@ fn paint_battery_only(p: &Painter, d: &Device, x: i32, w: i32) {
         None => {
             p.text(&battery_text(d), &p.rect(x + 140, 150, w - 170, 40), TEXT, a.fonts.h2, DT_SINGLELINE | DT_VCENTER);
             p.text("Este dispositivo no tiene luces configurables.", &p.rect(x + 140, 196, w - 170, 22), SUB, a.fonts.body, DT_SINGLELINE);
+            if d.kind == "Placa base" {
+                let hint = "Para controlar sus luces (y las de RAM, gráfica, ventiladores…), instala OpenRGB, \
+                            actívale el servidor SDK (pestaña SDK Server › Start Server) y déjalo abierto: \
+                            sus dispositivos aparecerán aquí en la lista.";
+                p.text(hint, &p.rect(x + 30, 350, w - 60, 80), SUB, a.fonts.body, DT_WORDBREAK);
+            }
         }
     }
     if !a.status.is_empty() {

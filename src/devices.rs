@@ -85,6 +85,8 @@ pub enum Driver {
     DualSense { path: Vec<u16>, bt: bool },
     DualShock4 { path: Vec<u16>, bt: bool },
     Logitech { path: Vec<u16>, idx: u8, led_feat: u8, zones: Vec<LogiZone> },
+    Switch { path: Vec<u16>, out_len: u16, home: bool },
+    OpenRgb { index: u32, leds: u16 },
     None,
 }
 
@@ -192,8 +194,47 @@ pub fn scan() -> Vec<Device> {
         });
     }
 
-    out.extend(xinput_devices());
-    out.extend(bluetooth_batteries());
+    // Cascos de otras marcas y mandos de Nintendo
+    out.extend(crate::headsets::scan(&all, &mut handled));
+    out.extend(crate::nintendo::scan(&all, &mut handled));
+
+    // Mandos Xbox (XInput) y dispositivos Bluetooth. Si un mando Xbox también publica su
+    // batería por Bluetooth (valor exacto), se usa esa y no se muestra dos veces.
+    let mut xbox = xinput_devices();
+    let mut bt = bluetooth_batteries();
+    for x in xbox.iter_mut().filter(|x| x.kind == "Mando" && x.battery.map(|b| b.approx).unwrap_or(true)) {
+        if let Some(pos) = bt.iter().position(|b| b.kind == "Mando" && b.name.to_lowercase().contains("xbox")) {
+            let b = bt.remove(pos);
+            x.battery = b.battery;
+            x.conn = "Bluetooth";
+        }
+    }
+    out.extend(xbox);
+    out.extend(bt);
+
+    // Todo lo que controla OpenRGB (placas base, RAM, gráficas, ventiladores…), si está abierto.
+    let native = ["dualsense", "dualshock", "g733", "tempest", "diablo"];
+    let orgb = crate::openrgb::scan();
+    if orgb.iter().any(|o| o.kind == "Placa base") {
+        // La placa base ya la controla OpenRGB: no mostrar también la entrada informativa.
+        handled.extend(all.iter().filter(|i| i.vid == 0x1462).map(|i| (i.vid, i.pid)));
+    }
+    for o in orgb {
+        let l = o.name.to_lowercase();
+        if native.iter().any(|n| l.contains(n)) {
+            continue;
+        }
+        out.push(Device {
+            key: format!("orgb-{}", o.name),
+            name: o.name.clone(),
+            kind: o.kind,
+            conn: "OpenRGB",
+            battery: None,
+            battery_note: "—",
+            led: Some(LedCaps { modes: vec![("Estático", 1), ("Apagado", MODE_OFF)], speed: false, multicolor: false, volatile: true, zones: vec![], pad_extras: false }),
+            driver: Driver::OpenRgb { index: o.index, leds: o.leds },
+        });
+    }
 
     // Resto de dispositivos USB con nombre (sólo informativo)
     let mut seen: HashSet<(u16, u16)> = HashSet::new();
@@ -274,6 +315,11 @@ pub fn apply(dev: &Device, s: &LedSetting, extra: Option<&Extra>) -> Result<(), 
             };
             logitech_apply(path, *idx, *led_feat, zones, &per_zone)
         }
+        Driver::Switch { path, out_len, home } => match extra {
+            Some(Extra::Pad(px)) => crate::nintendo::apply(path, *out_len, *home, px),
+            _ => Ok(()),
+        },
+        Driver::OpenRgb { index, leds } => crate::openrgb::set_color(*index, *leds, scaled(s)),
         Driver::None => Err("Este dispositivo no tiene luces controlables".into()),
     }
 }
@@ -944,6 +990,48 @@ fn compx_battery(i: &HidInfo) -> Result<Battery, &'static str> {
 
 // ---------------------------------------------------------------- Xbox (XInput)
 
+/// Modelo de un mando Xbox a partir de su identificador de producto.
+fn xbox_model(vid: u16, pid: u16) -> &'static str {
+    if vid != 0x045E {
+        return "Mando compatible Xbox";
+    }
+    match pid {
+        0x0B12 | 0x0B13 | 0x0B20 | 0x0B21 => "Mando Xbox Series X|S",
+        0x0B00 | 0x0B05 | 0x0B22 => "Mando Xbox Elite Series 2",
+        0x02E3 => "Mando Xbox Elite",
+        0x02EA | 0x02FD | 0x0B0A => "Mando Xbox One S",
+        0x02D1 | 0x02DD | 0x02E0 => "Mando Xbox One",
+        0x0B0C => "Mando adaptativo Xbox",
+        0x028E | 0x028F | 0x0719 => "Mando Xbox 360",
+        _ => "Mando Xbox",
+    }
+}
+
+/// XInputGetCapabilitiesEx (función no documentada, ordinal 108 de xinput1_4) para saber el modelo.
+fn xinput_ids(n: u32) -> Option<(u16, u16)> {
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    #[repr(C)]
+    struct CapsEx {
+        caps: [u8; 20],
+        vid: u16,
+        pid: u16,
+        rev: u16,
+        _pad: u16,
+        _id: u32,
+    }
+    type F = unsafe extern "system" fn(u32, u32, u32, *mut CapsEx) -> u32;
+    unsafe {
+        let name: Vec<u16> = "xinput1_4.dll\0".encode_utf16().collect();
+        let lib = LoadLibraryW(name.as_ptr());
+        if lib.is_null() {
+            return None;
+        }
+        let f: F = std::mem::transmute(GetProcAddress(lib, 108 as _)?);
+        let mut c: CapsEx = std::mem::zeroed();
+        (f(1, n, 0, &mut c) == 0).then_some((c.vid, c.pid))
+    }
+}
+
 fn xinput_devices() -> Vec<Device> {
     use windows_sys::Win32::UI::Input::XboxController::*;
     let mut out = Vec::new();
@@ -967,9 +1055,30 @@ fn xinput_devices() -> Vec<Device> {
             } else {
                 None
             };
+            let model = xinput_ids(n).map(|(v, p)| xbox_model(v, p)).unwrap_or("Mando Xbox");
+            // Cascos conectados al mando (inalámbricos Xbox)
+            let mut hb: XINPUT_BATTERY_INFORMATION = std::mem::zeroed();
+            if XInputGetBatteryInformation(n, BATTERY_DEVTYPE_HEADSET, &mut hb) == 0 && matches!(hb.BatteryType, BATTERY_TYPE_ALKALINE | BATTERY_TYPE_NIMH) {
+                let pct = match hb.BatteryLevel {
+                    BATTERY_LEVEL_EMPTY => 5,
+                    BATTERY_LEVEL_LOW => 25,
+                    BATTERY_LEVEL_MEDIUM => 60,
+                    _ => 100,
+                };
+                out.push(Device {
+                    key: format!("xinput-hs-{n}"),
+                    name: "Cascos Xbox".into(),
+                    kind: "Cascos",
+                    conn: "Inalámbrico Xbox",
+                    battery: Some(Battery { pct, charging: false, approx: true }),
+                    battery_note: "",
+                    led: None,
+                    driver: Driver::None,
+                });
+            }
             out.push(Device {
                 key: format!("xinput-{n}"),
-                name: format!("Mando Xbox / XInput {}", n + 1),
+                name: if n == 0 { model.to_string() } else { format!("{} ({})", model, n + 1) },
                 kind: "Mando",
                 conn: if wired { "USB" } else { "Inalámbrico" },
                 battery,
