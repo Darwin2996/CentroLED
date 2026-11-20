@@ -8,7 +8,7 @@ mod kb_layout;
 mod kb_template;
 mod update;
 
-use devices::{Device, KbExtra, LedSetting, KB_LEDS, MODE_CUSTOM, MODE_CYCLE, MODE_OFF, RIM_MODES};
+use devices::{is_app_animated, Device, Extra, KbExtra, LedSetting, PadExtra, KB_LEDS, MODE_CUSTOM, MODE_CYCLE, MODE_OFF, MODE_SW_BREATH, MODE_SW_RAINBOW, RIM_MODES};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
@@ -42,6 +42,9 @@ const TIMER_PROMOTE: usize = 4;
 const TIMER_UPDATE: usize = 5;
 const WM_UPD_INFO: u32 = WM_APP + 4;
 const WM_UPD_DONE: u32 = WM_APP + 5;
+/// Petición de cierre real (la usa el desinstalador).
+const WM_QUIT_APP: u32 = WM_APP + 9;
+const UNINSTALL_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\CentroLED";
 
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const APP_NAME: &str = "CentroLED";
@@ -131,6 +134,9 @@ enum Act {
     FillAll,
     ClearAll,
     CycleRemove(usize),
+    PlayerLed(u8),
+    PlayerBright(u8),
+    Mic(u8),
     Apply,
     Scan,
     Autostart,
@@ -156,6 +162,7 @@ struct Config {
     keys: HashMap<String, Box<[[u8; 3]; KB_LEDS]>>,
     cycles: HashMap<String, Vec<[u8; 3]>>,
     hide_tray_battery: bool,
+    pads: HashMap<String, PadExtra>,
 }
 
 /// Hilo que funde suavemente los colores del ciclo en un mando.
@@ -179,6 +186,10 @@ struct App {
     keys: Box<[[u8; 3]; KB_LEDS]>,
     cycle: Vec<[u8; 3]>,
     cyclers: HashMap<String, Cycler>,
+    /// Ajustes por zona (cascos con varias luces); vacío si el dispositivo tiene una sola.
+    zones: Vec<LedSetting>,
+    /// LEDs de jugador y micrófono del DualSense.
+    pad: PadExtra,
     dirty: bool,
     config: Config,
     known: HashSet<String>,
@@ -239,7 +250,19 @@ fn s(v: i32) -> i32 {
 
 // ------------------------------------------------------------------ configuración
 
+/// Versión portable: el ejecutable se llama "...portable..." o hay un "portable.txt" a su lado.
+/// En ese caso la configuración se guarda junto al programa (sirve para llevarlo en un USB).
+fn portable_dir() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?.to_path_buf();
+    let name = exe.file_name()?.to_string_lossy().to_lowercase();
+    (name.contains("portable") || dir.join("portable.txt").exists()).then_some(dir)
+}
+
 fn config_path() -> std::path::PathBuf {
+    if let Some(dir) = portable_dir() {
+        return dir.join("CentroLED-datos").join("config.txt");
+    }
     let base = std::env::var_os("APPDATA").map(std::path::PathBuf::from).unwrap_or_else(|| ".".into());
     base.join(APP_NAME).join("config.txt")
 }
@@ -260,6 +283,9 @@ fn load_config() -> Config {
                 *k = parse_rgb(&f[2][i * 6..i * 6 + 6]).unwrap_or([0; 3]);
             }
             cfg.keys.insert(f[1].to_string(), keys);
+        } else if f.len() == 5 && f[0] == "#pad" {
+            let n = |s: &str| s.parse::<u8>().unwrap_or(0);
+            cfg.pads.insert(f[1].to_string(), PadExtra { player: n(f[2]), player_bright: n(f[3]), mic: n(f[4]) });
         } else if f.len() == 3 && f[0] == "#opt" && f[1] == "hide_tray_battery" {
             cfg.hide_tray_battery = f[2] == "1";
         } else if f.len() == 3 && f[0] == "#cycle" {
@@ -291,6 +317,9 @@ fn save_config(cfg: &Config) {
     for (k, list) in &cfg.cycles {
         let hex: String = list.iter().map(|c| format!("{:02x}{:02x}{:02x}", c[0], c[1], c[2])).collect();
         text += &format!("#cycle\t{}\t{}\n", k, hex);
+    }
+    for (k, x) in &cfg.pads {
+        text += &format!("#pad\t{}\t{}\t{}\t{}\n", k, x.player, x.player_bright, x.mic);
     }
     text += &format!("#opt\thide_tray_battery\t{}\n", cfg.hide_tray_battery as u8);
     let _ = std::fs::write(path, text);
@@ -375,7 +404,7 @@ fn start_scan() {
     });
 }
 
-fn start_apply(dev: Device, st: LedSetting, kb: Option<KbExtra>, silent: bool) {
+fn start_apply(dev: Device, st: LedSetting, extra: Option<Extra>, silent: bool) {
     let hwnd = app().hwnd as isize;
     if !silent {
         app().applying = true;
@@ -383,7 +412,7 @@ fn start_apply(dev: Device, st: LedSetting, kb: Option<KbExtra>, silent: bool) {
     std::thread::spawn(move || {
         let res = {
             let _g = HID_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            devices::apply(&dev, &st, kb.as_ref())
+            devices::apply(&dev, &st, extra.as_ref())
         };
         let msg = match res {
             Ok(()) if silent => format!("Luces restauradas en {}", dev.name),
@@ -394,11 +423,34 @@ fn start_apply(dev: Device, st: LedSetting, kb: Option<KbExtra>, silent: bool) {
     });
 }
 
-/// Arranca (o reinicia) el ciclo suave de colores de un mando. Mantiene el mando abierto y
-/// envía ~30 colores por segundo interpolados; si el mando se desconecta, el hilo termina.
-fn start_cycle(dev: Device, colors: Vec<[u8; 3]>, st: LedSetting) {
+/// Color (sin aplicar el brillo) de una animación de la app en el instante `t` (segundos).
+fn anim_color(st: &LedSetting, colors: &[[u8; 3]], t: f32) -> [u8; 3] {
+    match st.mode {
+        MODE_CYCLE if colors.len() >= 2 => {
+            // De 8 s a 0,5 s por color.
+            let t = t / (8.0 - st.speed as f32 * 0.075);
+            let i = t.floor() as usize % colors.len();
+            let (a, b) = (colors[i], colors[(i + 1) % colors.len()]);
+            let f = t.fract();
+            let f = f * f * (3.0 - 2.0 * f);
+            [0, 1, 2].map(|n| (a[n] as f32 + (b[n] as f32 - a[n] as f32) * f).round() as u8)
+        }
+        MODE_SW_BREATH => {
+            // Respiración de 6 s a 1 s.
+            let ph = t / (6.0 - st.speed as f32 * 0.05);
+            let k = 0.04 + 0.96 * (0.5 - 0.5 * (ph * std::f32::consts::TAU).cos());
+            [st.rgb.0, st.rgb.1, st.rgb.2].map(|c| (c as f32 * k).round() as u8)
+        }
+        MODE_SW_RAINBOW => hue(t / (12.0 - st.speed as f32 * 0.11)),
+        _ => [st.rgb.0, st.rgb.1, st.rgb.2],
+    }
+}
+
+/// Arranca (o reinicia) una animación de la app en un mando (ciclo, respiración o arcoíris).
+/// Mantiene el mando abierto y envía ~30 colores por segundo; si se desconecta, el hilo termina.
+fn start_cycle(dev: Device, colors: Vec<[u8; 3]>, st: LedSetting, pad: Option<PadExtra>) {
     stop_cycle(&dev.key);
-    if colors.len() < 2 {
+    if st.mode == MODE_CYCLE && colors.len() < 2 {
         return;
     }
     let stop = Arc::new(AtomicBool::new(false));
@@ -406,19 +458,16 @@ fn start_cycle(dev: Device, colors: Vec<[u8; 3]>, st: LedSetting) {
     app().cyclers.insert(dev.key.clone(), Cycler { stop: stop.clone(), alive: alive.clone() });
     std::thread::spawn(move || {
         if let Ok(lb) = devices::Lightbar::open(&dev) {
-            // Velocidad 0..100 -> de 8 s a 0,5 s por color.
-            let secs = 8.0 - st.speed as f32 * 0.075;
+            if let Some(px) = pad {
+                lb.set_extras(&px);
+            }
             let k = st.bright as f32 / 100.0;
             let start = std::time::Instant::now();
             let mut last = None;
             let mut fails = 0;
             while !stop.load(Ordering::Relaxed) {
-                let t = start.elapsed().as_secs_f32() / secs;
-                let i = t.floor() as usize % colors.len();
-                let (a, b) = (colors[i], colors[(i + 1) % colors.len()]);
-                let f = t.fract();
-                let f = f * f * (3.0 - 2.0 * f); // suavizado
-                let ch = |n: usize| ((a[n] as f32 + (b[n] as f32 - a[n] as f32) * f) * k).round() as u8;
+                let ac = anim_color(&st, &colors, start.elapsed().as_secs_f32());
+                let ch = |n: usize| (ac[n] as f32 * k).round() as u8;
                 let c = (ch(0), ch(1), ch(2));
                 if last != Some(c) {
                     if lb.set(c) {
@@ -476,13 +525,34 @@ fn select_device(i: usize) {
     let c = [a.cur.rgb.0, a.cur.rgb.1, a.cur.rgb.2];
     a.keys = a.config.keys.get(&d.key).cloned().unwrap_or_else(|| Box::new([c; KB_LEDS]));
     a.cycle = a.config.cycles.get(&d.key).cloned().unwrap_or_else(|| vec![[0x69, 0x00, 0xFF], [0x00, 0xA2, 0xFF], [0xFF, 0x00, 0xB4]]);
+    let nz = d.led.as_ref().map(|l| l.zones.len()).unwrap_or(0);
+    let cur = a.cur;
+    a.zones = (0..nz).map(|i| a.config.led.get(&format!("{}#z{}", d.key, i)).copied().unwrap_or(cur)).collect();
+    a.pad = a.config.pads.get(&d.key).copied().unwrap_or_default();
     redraw();
 }
 
-/// Ajuste que se está editando: el del borde en la pestaña Borde, si no el principal.
+/// Datos extra guardados de un dispositivo (zonas o LEDs del mando) para reaplicarlos.
+fn saved_extra(d: &Device) -> Option<Extra> {
+    let a = app();
+    let caps = d.led.as_ref()?;
+    if !caps.zones.is_empty() {
+        let base = a.config.led.get(&d.key).copied()?;
+        return Some(Extra::Zones((0..caps.zones.len()).map(|i| a.config.led.get(&format!("{}#z{}", d.key, i)).copied().unwrap_or(base)).collect()));
+    }
+    if caps.pad_extras {
+        return a.config.pads.get(&d.key).map(|p| Extra::Pad(*p));
+    }
+    None
+}
+
+/// Ajuste que se está editando: la zona de la pestaña elegida, el borde del teclado o el principal.
 fn editing() -> &'static mut LedSetting {
     let a = app();
-    if a.tab == 1 {
+    if !a.zones.is_empty() {
+        let i = (a.tab as usize).min(a.zones.len() - 1);
+        &mut a.zones[i]
+    } else if a.tab == 1 {
         &mut a.rim
     } else {
         &mut a.cur
@@ -495,31 +565,46 @@ fn on_apply() {
     if d.led.is_none() || a.applying {
         return;
     }
+    let caps = d.led.clone().unwrap();
+    if !a.zones.is_empty() {
+        a.cur = a.zones[0];
+        for (i, z) in a.zones.iter().enumerate() {
+            a.config.led.insert(format!("{}#z{}", d.key, i), *z);
+        }
+    }
     a.config.led.insert(d.key.clone(), a.cur);
-    let kb = if is_keyboard(&d) {
+    let extra = if is_keyboard(&d) {
         a.config.led.insert(format!("{}#borde", d.key), a.rim);
         a.config.keys.insert(d.key.clone(), a.keys.clone());
-        Some(KbExtra { rim: a.rim, keys: a.keys.clone() })
+        Some(Extra::Keyboard(KbExtra { rim: a.rim, keys: a.keys.clone() }))
+    } else if !a.zones.is_empty() {
+        Some(Extra::Zones(a.zones.clone()))
+    } else if caps.pad_extras {
+        a.config.pads.insert(d.key.clone(), a.pad);
+        Some(Extra::Pad(a.pad))
     } else {
         None
     };
-    if a.cur.mode == MODE_CYCLE {
-        if a.cycle.len() < 2 {
-            set_status("Elige al menos 2 colores para el ciclo");
-            return;
+    if is_app_animated(a.cur.mode) {
+        if a.cur.mode == MODE_CYCLE {
+            if a.cycle.len() < 2 {
+                set_status("Elige al menos 2 colores para el ciclo");
+                return;
+            }
+            a.config.cycles.insert(d.key.clone(), a.cycle.clone());
         }
-        a.config.cycles.insert(d.key.clone(), a.cycle.clone());
         save_config(&a.config);
         a.dirty = false;
-        set_status(&format!("✓ Ciclo de {} colores activo en {}", a.cycle.len(), d.name));
-        start_cycle(d, a.cycle.clone(), a.cur);
+        let pad = if caps.pad_extras { Some(a.pad) } else { None };
+        set_status(&format!("✓ Efecto activo en {}", d.name));
+        start_cycle(d, a.cycle.clone(), a.cur, pad);
         return;
     }
     stop_cycle(&d.key);
     save_config(&a.config);
     a.dirty = false;
     set_status(&format!("Aplicando a {}…", d.name));
-    start_apply(d, a.cur, kb, false);
+    start_apply(d, a.cur, extra, false);
 }
 
 fn pick_more_colors() {
@@ -539,7 +624,7 @@ fn pick_more_colors() {
 
 fn cycle_editing() -> bool {
     let a = app();
-    a.tab == 0 && a.cur.mode == MODE_CYCLE
+    a.zones.is_empty() && a.tab == 0 && a.cur.mode == MODE_CYCLE
 }
 
 fn set_color(c: [u8; 3]) {
@@ -677,6 +762,10 @@ fn glyph(d: &Device) -> &'static str {
         "Cascos" => "\u{E7F6}",
         "Ratón" => "\u{E962}",
         "Bluetooth" => "\u{E702}",
+        "Lápiz" => "\u{EDC6}",
+        "Reloj" => "\u{E916}",
+        "Móvil" => "\u{E8EA}",
+        "Placa base" => "\u{E950}",
         _ => "\u{E772}",
     }
 }
@@ -900,12 +989,15 @@ fn paint_device(p: &Painter, d: &Device, x: i32, w: i32) {
     };
     let keyboard = is_keyboard(d);
     let mut y = 96;
-    if keyboard {
-        // Pestañas Teclas / Borde
-        let tabs = p.rect(x, y, 240, 36);
+    // Pestañas: Teclas / Borde en el teclado, o una por zona de luz.
+    let tab_names: Vec<String> = if keyboard { vec!["Teclas".into(), "Borde".into()] } else { caps.zones.clone() };
+    if !tab_names.is_empty() {
+        let widths: Vec<i32> = tab_names.iter().map(|n| (p.measure(n, a.fonts.bold) + 40).max(116)).collect();
+        let tabs = p.rect(x, y, widths.iter().sum::<i32>() + 8, 36);
         p.fill(&tabs, CARD, 10);
-        for (i, name) in ["Teclas", "Borde"].iter().enumerate() {
-            let r = p.rect(x + 4 + i as i32 * 116, y + 4, 116, 28);
+        let mut tx = x + 4;
+        for (i, name) in tab_names.iter().enumerate() {
+            let r = p.rect(tx, y + 4, widths[i], 28);
             if a.tab == i as u8 {
                 p.fill(&r, ACCENT, 8);
             } else if is_hot(Act::Tab(i as u8)) {
@@ -913,11 +1005,20 @@ fn paint_device(p: &Painter, d: &Device, x: i32, w: i32) {
             }
             p.text(name, &r, TEXT, a.fonts.bold, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             hit(r, Act::Tab(i as u8));
+            tx += widths[i];
         }
+        if !keyboard {
+            p.text("Cada zona tiene su propio efecto y color", &p.rect(tx + 20, y, 400, 36), SUB, a.fonts.small, DT_SINGLELINE | DT_VCENTER);
+        }
+    }
+    if keyboard {
         y += 52;
         a.preview = Some((true, x, y, w));
         y = paint_keyboard(p, x, y, w) + 18;
     } else {
+        if !tab_names.is_empty() {
+            y += 44;
+        }
         a.preview = Some((false, x, y, w));
         y = paint_device_hero(p, d, x, y, w) + 18;
     }
@@ -970,10 +1071,16 @@ fn paint_device(p: &Painter, d: &Device, x: i32, w: i32) {
         }
         y += 50;
     }
-    section(p, if custom { "COLOR DEL PINCEL" } else if cycle { "AÑADIR COLOR" } else { "COLOR" }, x, y);
+    let no_color = matches!(e.mode, MODE_SW_RAINBOW | MODE_OFF) || (!keyboard && matches!(e.mode, 0x03 | 0x0E));
+    if no_color {
+        section(p, "COLOR", x, y);
+        p.text("Este efecto recorre todos los colores por sí mismo.", &p.rect(x, y + 22, w, 30), SUB, a.fonts.body, DT_SINGLELINE | DT_VCENTER);
+    }
+    section(p, if no_color { "" } else if custom { "COLOR DEL PINCEL" } else if cycle { "AÑADIR COLOR" } else { "COLOR" }, x, y);
     y += 22;
     let mut cx = x;
-    for c in PALETTE {
+    for c in if no_color { &[][..] } else { &PALETTE[..] } {
+        let c = *c;
         let r = p.rect(cx, y, 30, 30);
         let current = !cycle && !e.multi && [e.rgb.0, e.rgb.1, e.rgb.2] == c;
         if current || is_hot(Act::Color(c)) {
@@ -984,13 +1091,15 @@ fn paint_device(p: &Painter, d: &Device, x: i32, w: i32) {
         cx += 40;
     }
     // Color libre
-    let r = p.rect(cx, y, 30, 30);
+    let r = if no_color { RECT { left: 0, top: 0, right: 0, bottom: 0 } } else { p.rect(cx, y, 30, 30) };
     let in_palette = cycle || PALETTE.contains(&[e.rgb.0, e.rgb.1, e.rgb.2]);
-    p.circle(&r, if in_palette { CARD } else { rgb(e.rgb.0, e.rgb.1, e.rgb.2) }, Some((if is_hot(Act::MoreColors) { TEXT } else { SUB }, 2)));
-    if in_palette {
-        p.text("+", &r, TEXT, a.fonts.h2, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    if !no_color {
+        p.circle(&r, if in_palette { CARD } else { rgb(e.rgb.0, e.rgb.1, e.rgb.2) }, Some((if is_hot(Act::MoreColors) { TEXT } else { SUB }, 2)));
+        if in_palette {
+            p.text("+", &r, TEXT, a.fonts.h2, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+        hit(r, Act::MoreColors);
     }
-    hit(r, Act::MoreColors);
     cx += 52;
     if custom {
         for (label, act) in [("Rellenar todo", Act::FillAll), ("Apagar todo", Act::ClearAll)] {
@@ -1013,6 +1122,10 @@ fn paint_device(p: &Painter, d: &Device, x: i32, w: i32) {
     let speed_on = caps.speed && !custom && !matches!(e.mode, 1 | 24 | 25 | MODE_OFF);
     let speed_label = if cycle { "Velocidad del ciclo" } else { "Velocidad" };
     paint_slider(p, speed_label, e.speed, x + half + 40, y, half, 1, speed_on);
+    y += 62;
+    if caps.pad_extras {
+        paint_pad_extras(p, x, y, w);
+    }
 
     // Barra inferior: estado + aplicar
     let by = WIN_H - 64;
@@ -1028,6 +1141,44 @@ fn paint_device(p: &Painter, d: &Device, x: i32, w: i32) {
     p.fill(&ar, if a.applying { LINE } else if is_hot(Act::Apply) { ACCENT_HOT } else { ACCENT }, 10);
     p.text(label, &ar, TEXT, a.fonts.bold, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     hit(ar, Act::Apply);
+}
+
+/// LEDs de jugador (5) con su brillo y LED del micrófono del DualSense.
+fn paint_pad_extras(p: &Painter, x: i32, y: i32, w: i32) {
+    let a = app();
+    section(p, "LEDS DE JUGADOR · CLIC PARA ENCENDER O APAGAR", x, y);
+    section(p, "LED DEL MICRÓFONO", x + w / 2 + 20, y);
+    let y = y + 22;
+    for i in 0..5u8 {
+        let on = a.pad.player & (1 << i) != 0;
+        let r = p.rect(x + i as i32 * 30, y + 9, 22, 12);
+        p.fill(&r, if on { rgb(0xF4, 0xF4, 0xFF) } else { LINE }, 6);
+        if is_hot(Act::PlayerLed(i)) {
+            p.stroke(&r, ACCENT, 6, 2);
+        }
+        hit(p.rect(x + i as i32 * 30 - 4, y, 30, 30), Act::PlayerLed(i));
+    }
+    let mut cx = x + 160;
+    for (n, label) in ["Alto", "Medio", "Bajo"].iter().enumerate() {
+        let tw = p.measure(label, a.fonts.small) + 20;
+        let r = p.rect(cx, y + 2, tw, 26);
+        let on = a.pad.player_bright == n as u8;
+        p.fill(&r, if on { ACCENT } else if is_hot(Act::PlayerBright(n as u8)) { CARD_HOT } else { CARD }, 13);
+        p.text(label, &r, if on { TEXT } else { mix(SUB, TEXT, 0.5) }, a.fonts.small, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        hit(r, Act::PlayerBright(n as u8));
+        cx += tw + 6;
+    }
+    let mut cx = x + w / 2 + 20;
+    for (n, label) in ["Apagado", "Encendido", "Parpadeo"].iter().enumerate() {
+        let tw = p.measure(label, a.fonts.small) + 20;
+        let r = p.rect(cx, y + 2, tw, 26);
+        let on = a.pad.mic == n as u8;
+        let col = if on { if n == 0 { ACCENT } else { rgb(0xE8, 0x6A, 0x1A) } } else if is_hot(Act::Mic(n as u8)) { CARD_HOT } else { CARD };
+        p.fill(&r, col, 13);
+        p.text(label, &r, if on { TEXT } else { mix(SUB, TEXT, 0.5) }, a.fonts.small, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        hit(r, Act::Mic(n as u8));
+        cx += tw + 6;
+    }
 }
 
 fn paint_slider(p: &Painter, label: &str, value: u8, x: i32, y: i32, w: i32, id: u8, enabled: bool) {
@@ -1205,7 +1356,7 @@ fn preview_animates() -> bool {
     let a = app();
     match selected() {
         Some(d) if is_keyboard(&d) => !matches!(a.cur.mode, 1 | MODE_CUSTOM | MODE_OFF) || !matches!(a.rim.mode, 24 | 25),
-        Some(d) => d.led.is_some() && a.cur.mode == MODE_CYCLE && a.cycle.len() >= 2,
+        Some(d) => d.led.is_some() && a.zones.is_empty() && is_app_animated(a.cur.mode) && (a.cur.mode != MODE_CYCLE || a.cycle.len() >= 2),
         None => false,
     }
 }
@@ -1295,18 +1446,13 @@ fn paint_keyboard(p: &Painter, x: i32, y: i32, w: i32) -> i32 {
 
 fn paint_device_hero(p: &Painter, d: &Device, x: i32, y: i32, w: i32) -> i32 {
     let a = app();
-    let e = a.cur;
-    let cycle = e.mode == MODE_CYCLE && a.cycle.len() >= 2;
+    let e = *editing();
+    let cycle = a.zones.is_empty() && e.mode == MODE_CYCLE && a.cycle.len() >= 2;
     let col = if e.mode == MODE_OFF {
         LINE
-    } else if cycle {
-        let secs = 8.0 - e.speed as f32 * 0.075;
-        let t = anim_time() / secs;
-        let n = a.cycle.len();
-        let i = t.floor() as usize % n;
-        let f = t.fract();
-        mix(to_ref(a.cycle[i]), to_ref(a.cycle[(i + 1) % n]), f * f * (3.0 - 2.0 * f))
-    } else if e.multi {
+    } else if a.zones.is_empty() && is_app_animated(e.mode) {
+        to_ref(anim_color(&e, &a.cycle, anim_time()))
+    } else if e.multi || matches!(e.mode, 0x03 | 0x0E) && !a.zones.is_empty() {
         to_ref(hue(0.75))
     } else {
         rgb(e.rgb.0, e.rgb.1, e.rgb.2)
@@ -1325,7 +1471,7 @@ fn paint_device_hero(p: &Painter, d: &Device, x: i32, y: i32, w: i32) -> i32 {
         }
         section(p, "VISTA PREVIA DEL CICLO", bx, y + 50);
     }
-    let size = 150;
+    let size = if d.led.as_ref().map(|l| l.pad_extras).unwrap_or(false) { 110 } else { 150 };
     let cx = x + (w - size) / 2;
     a.anim_rect = p.rect(cx - 30, y - 20, size + 60, size + 70);
     let bright = e.bright as f32 / 100.0;
@@ -1440,6 +1586,21 @@ fn on_click(act: Act, x: i32) {
             a.dirty = true;
             redraw();
         }
+        Act::PlayerLed(i) => {
+            a.pad.player ^= 1 << i;
+            a.dirty = true;
+            redraw();
+        }
+        Act::PlayerBright(n) => {
+            a.pad.player_bright = n;
+            a.dirty = true;
+            redraw();
+        }
+        Act::Mic(n) => {
+            a.pad.mic = n;
+            a.dirty = true;
+            redraw();
+        }
         Act::CycleRemove(i) => {
             if i < a.cycle.len() {
                 a.cycle.remove(i);
@@ -1479,12 +1640,12 @@ fn on_scanned(list: Vec<Device>) {
     for d in &list {
         if d.led.as_ref().map(|l| l.volatile).unwrap_or(false) && !a.known.contains(&d.key) {
             if let Some(st) = a.config.led.get(&d.key) {
-                if st.mode == MODE_CYCLE {
-                    if let Some(list) = a.config.cycles.get(&d.key) {
-                        start_cycle(d.clone(), list.clone(), *st);
-                    }
+                let pad = a.config.pads.get(&d.key).copied();
+                if is_app_animated(st.mode) {
+                    let list = a.config.cycles.get(&d.key).cloned().unwrap_or_default();
+                    start_cycle(d.clone(), list, *st, pad);
                 } else {
-                    start_apply(d.clone(), *st, None, true);
+                    start_apply(d.clone(), *st, saved_extra(d), true);
                 }
             }
         }
@@ -1492,10 +1653,9 @@ fn on_scanned(list: Vec<Device>) {
     // Si un ciclo se cortó (p. ej. el mando se reconectó rápido), volver a arrancarlo.
     for d in &list {
         if let Some(st) = a.config.led.get(&d.key) {
-            if st.mode == MODE_CYCLE && a.known.contains(&d.key) && !cycle_running(&d.key) {
-                if let Some(cl) = a.config.cycles.get(&d.key) {
-                    start_cycle(d.clone(), cl.clone(), *st);
-                }
+            if is_app_animated(st.mode) && a.known.contains(&d.key) && !cycle_running(&d.key) {
+                let list = a.config.cycles.get(&d.key).cloned().unwrap_or_default();
+                start_cycle(d.clone(), list, *st, a.config.pads.get(&d.key).copied());
             }
         }
     }
@@ -1530,37 +1690,65 @@ fn on_scanned(list: Vec<Device>) {
 
 // ------------------------------------------------------------------ bandeja del sistema e icono
 
-/// Crea un icono de `size` px dibujando con GDI; el color clave magenta queda transparente.
-unsafe fn icon_from(size: i32, draw: impl FnOnce(HDC, RECT)) -> HICON {
+/// Crea un icono de `size` px. Se dibuja con GDI a 4x (fondo magenta = transparente) y se
+/// reduce promediando, lo que da bordes suaves y transparencia real.
+unsafe fn icon_from(size: i32, draw: impl FnOnce(HDC, i32)) -> HICON {
+    const SS: i32 = 4;
+    let big = size * SS;
     let screen = GetDC(null_mut());
     let dc = CreateCompatibleDC(screen);
-    let mut bmi: BITMAPINFO = std::mem::zeroed();
-    bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-    bmi.bmiHeader.biWidth = size;
-    bmi.bmiHeader.biHeight = -size;
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    let mut bits: *mut core::ffi::c_void = null_mut();
-    let color = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
-    let old = SelectObject(dc, color);
-    let all = RECT { left: 0, top: 0, right: size, bottom: size };
+    let dib = |w: i32, bits: &mut *mut core::ffi::c_void| {
+        let mut bmi: BITMAPINFO = std::mem::zeroed();
+        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        bmi.bmiHeader.biWidth = w;
+        bmi.bmiHeader.biHeight = -w;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, bits, null_mut(), 0)
+    };
+    let mut big_bits: *mut core::ffi::c_void = null_mut();
+    let big_bmp = dib(big, &mut big_bits);
+    let old = SelectObject(dc, big_bmp);
+    let all = RECT { left: 0, top: 0, right: big, bottom: big };
     let kb = CreateSolidBrush(rgb(0xFF, 0x00, 0xFF));
     FillRect(dc, &all, kb);
     DeleteObject(kb);
     SetBkMode(dc, TRANSPARENT as i32);
-    draw(dc, all);
+    draw(dc, big);
     GdiFlush();
-    let px = std::slice::from_raw_parts_mut(bits as *mut u32, (size * size) as usize);
-    for v in px.iter_mut() {
-        let bgr = *v & 0x00FF_FFFF;
-        *v = if bgr == 0x00FF_00FF { 0 } else { bgr | 0xFF00_0000 };
-    }
     SelectObject(dc, old);
+    let src = std::slice::from_raw_parts(big_bits as *const u32, (big * big) as usize);
+    let mut bits: *mut core::ffi::c_void = null_mut();
+    let color = dib(size, &mut bits);
+    let dst = std::slice::from_raw_parts_mut(bits as *mut u32, (size * size) as usize);
+    for y in 0..size {
+        for x in 0..size {
+            let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
+            for sy in 0..SS {
+                for sx in 0..SS {
+                    let v = src[((y * SS + sy) * big + x * SS + sx) as usize] & 0x00FF_FFFF;
+                    if v != 0x00FF_00FF {
+                        r += (v >> 16) & 0xFF;
+                        g += (v >> 8) & 0xFF;
+                        b += v & 0xFF;
+                        n += 1;
+                    }
+                }
+            }
+            dst[(y * size + x) as usize] = if n == 0 {
+                0
+            } else {
+                let alpha = n * 255 / (SS * SS) as u32;
+                (alpha << 24) | ((r / n) << 16) | ((g / n) << 8) | (b / n)
+            };
+        }
+    }
     let mask = CreateBitmap(size, size, 1, 1, null());
     let info = ICONINFO { fIcon: 1, xHotspot: 0, yHotspot: 0, hbmMask: mask, hbmColor: color };
     let icon = CreateIconIndirect(&info);
     DeleteObject(mask);
     DeleteObject(color);
+    DeleteObject(big_bmp);
     DeleteDC(dc);
     ReleaseDC(null_mut(), screen);
     icon
@@ -1583,44 +1771,74 @@ unsafe fn gdi_round(dc: HDC, r: RECT, rad: i32, fill: Option<u32>, pen: Option<(
     }
 }
 
-/// Icono de batería para la barra de tareas: pila con el nivel relleno y el porcentaje dentro.
+unsafe fn gdi_text(dc: HDC, text: &str, rc: RECT, face: &str, height: i32, width: i32, weight: i32, color: u32) {
+    let mut lf: LOGFONTW = std::mem::zeroed();
+    lf.lfHeight = -height;
+    lf.lfWidth = width;
+    lf.lfWeight = weight;
+    lf.lfQuality = 3; // sin suavizado GDI: el suavizado lo da la reducción 4x
+    for (i, c) in face.encode_utf16().take(31).enumerate() {
+        lf.lfFaceName[i] = c;
+    }
+    let font = CreateFontIndirectW(&lf);
+    let of = SelectObject(dc, font);
+    SetTextColor(dc, color);
+    let w: Vec<u16> = text.encode_utf16().collect();
+    let mut rc = rc;
+    DrawTextW(dc, w.as_ptr(), w.len() as i32, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(dc, of);
+    DeleteObject(font);
+}
+
+/// Icono de batería para la barra de tareas: arriba el dibujo del tipo de dispositivo y
+/// debajo una pila con el nivel relleno y el porcentaje dentro.
 /// `stale` = último valor conocido (dispositivo dormido): se dibuja apagado.
-unsafe fn make_battery_icon(size: i32, pct: u8, charging: bool, stale: bool) -> HICON {
-    icon_from(size, |dc, _| {
-        let u = |f: f32| (f * size as f32).round() as i32;
-        // Cuerpo y borne
-        let body = RECT { left: 0, top: u(0.18), right: size - u(0.12), bottom: size - u(0.18) };
-        let outline = if charging { rgb(0xFF, 0xD3, 0x3D) } else if stale { rgb(0x80, 0x80, 0x8C) } else { rgb(0xF2, 0xF2, 0xF6) };
-        gdi_round(dc, RECT { left: body.right - 1, top: u(0.38), right: size, bottom: size - u(0.38) }, u(0.1), Some(outline), None);
-        gdi_round(dc, body, u(0.22), Some(rgb(0x1C, 0x1C, 0x24)), None);
-        // Relleno según el nivel
-        let inner = RECT { left: body.left + 2, top: body.top + 2, right: body.right - 2, bottom: body.bottom - 2 };
+/// ¿La barra de tareas usa el tema claro? (los iconos se dibujan entonces en oscuro)
+fn taskbar_light() -> bool {
+    unsafe {
+        let mut key: HKEY = null_mut();
+        let path = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
+        if RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, KEY_QUERY_VALUE, &mut key) != 0 {
+            return false;
+        }
+        let mut v: u32 = 0;
+        let mut size = 4u32;
+        let ok = RegQueryValueExW(key, wide("SystemUsesLightTheme").as_ptr(), null(), null_mut(), &mut v as *mut u32 as *mut u8, &mut size) == 0;
+        RegCloseKey(key);
+        ok && v == 1
+    }
+}
+
+unsafe fn make_battery_icon(size: i32, pct: u8, charging: bool, stale: bool, glyph: &str) -> HICON {
+    let light = taskbar_light();
+    icon_from(size, |dc, s| {
+        let u = |f: f32| (f * s as f32).round() as i32;
+        let white = match (light, stale) {
+            (false, false) => rgb(0xFF, 0xFF, 0xFF),
+            (false, true) => rgb(0xA8, 0xA8, 0xB4),
+            (true, false) => rgb(0x1A, 0x1A, 0x1A),
+            (true, true) => rgb(0x70, 0x70, 0x78),
+        };
+        // Dibujo del dispositivo (mitad superior)
+        gdi_text(dc, glyph, RECT { left: 0, top: 0, right: s, bottom: u(0.50) }, "Segoe Fluent Icons", u(0.46), 0, 400, white);
+        // Pila (mitad inferior)
+        let body = RECT { left: u(0.02), top: u(0.52), right: s - u(0.10), bottom: s - u(0.02) };
+        let outline = if charging { rgb(0xFF, 0xD3, 0x3D) } else { white };
+        gdi_round(dc, RECT { left: body.right - u(0.02), top: u(0.66), right: s, bottom: s - u(0.16) }, u(0.06), Some(outline), None);
+        gdi_round(dc, body, u(0.14), Some(outline), None);
+        let line = u(0.05).max(2);
+        let inner = RECT { left: body.left + line, top: body.top + line, right: body.right - line, bottom: body.bottom - line };
+        gdi_round(dc, inner, u(0.10), Some(rgb(0x1C, 0x1C, 0x24)), None);
+        let level = if stale { rgb(0x55, 0x55, 0x60) } else if pct > 50 { rgb(0x23, 0xA8, 0x5E) } else if pct > 20 { rgb(0xD4, 0x88, 0x0C) } else { rgb(0xD9, 0x3A, 0x3F) };
         let fw = ((inner.right - inner.left) as f32 * pct.min(100) as f32 / 100.0).round() as i32;
-        let level = if stale { rgb(0x4A, 0x4A, 0x55) } else if pct > 50 { rgb(0x23, 0xA8, 0x5E) } else if pct > 20 { rgb(0xD4, 0x88, 0x0C) } else { rgb(0xD9, 0x3A, 0x3F) };
         if fw > 0 {
-            gdi_round(dc, RECT { right: inner.left + fw.max(2), ..inner }, u(0.14), Some(level), None);
+            gdi_round(dc, RECT { right: inner.left + fw.max(line), ..inner }, u(0.08), Some(level), None);
         }
-        gdi_round(dc, body, u(0.22), None, Some((outline, (size / 16).max(1))));
-        // Número
-        let mut lf: LOGFONTW = std::mem::zeroed();
-        let text = if pct >= 100 { "100".to_string() } else { pct.to_string() };
-        lf.lfHeight = -((body.bottom - body.top) as f32 * if text.len() >= 3 { 0.78 } else { 0.92 }) as i32;
-        lf.lfWeight = 800;
-        lf.lfQuality = 3; // sin suavizado: bordes limpios sobre fondo transparente
-        for (i, c) in "Segoe UI".encode_utf16().enumerate() {
-            lf.lfFaceName[i] = c;
-        }
-        if text.len() >= 3 {
-            lf.lfWidth = (body.right - body.left) / 4;
-        }
-        let font = CreateFontIndirectW(&lf);
-        let of = SelectObject(dc, font);
-        SetTextColor(dc, rgb(0xFF, 0xFF, 0xFF));
-        let w: Vec<u16> = text.encode_utf16().collect();
-        let mut rc = body;
-        DrawTextW(dc, w.as_ptr(), w.len() as i32, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        SelectObject(dc, of);
-        DeleteObject(font);
+        // Porcentaje
+        let text = pct.min(100).to_string();
+        let h = (inner.bottom - inner.top) as f32;
+        let wdt = if text.len() >= 3 { ((inner.right - inner.left) as f32 / 3.4) as i32 } else { 0 };
+        gdi_text(dc, &text, inner, "Segoe UI", (h * 1.05) as i32, wdt, 800, rgb(0xFF, 0xFF, 0xFF));
     })
 }
 
@@ -1628,7 +1846,7 @@ unsafe fn make_battery_icon(size: i32, pct: u8, charging: bool, stale: bool) -> 
 fn update_battery_icons() {
     let a = app();
     let size = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16);
-    let mut wanted: Vec<(String, String, (u8, bool, bool))> = Vec::new();
+    let mut wanted: Vec<(String, String, (u8, bool, bool), &'static str)> = Vec::new();
     if !a.config.hide_tray_battery {
         for d in &a.devices {
             let state = match d.battery {
@@ -1638,7 +1856,7 @@ fn update_battery_icons() {
                     None => continue,
                 },
             };
-            wanted.push((d.key.clone(), format!("{}\n{}", d.name, battery_text(d)), state));
+            wanted.push((d.key.clone(), format!("{}\n{}", d.name, battery_text(d)), state, glyph(d)));
         }
     }
     // Quitar los que sobran
@@ -1650,7 +1868,7 @@ fn update_battery_icons() {
         }
     }
     // Añadir o actualizar
-    for (key, tip, state) in wanted {
+    for (key, tip, state, g) in wanted {
         let existing = a.tray_batt.get(&key).map(|t| (t.id, t.state));
         let (id, add) = match existing {
             Some((id, st)) if st == state => {
@@ -1663,7 +1881,7 @@ fn update_battery_icons() {
                 (a.next_tray_id, true)
             }
         };
-        let icon = unsafe { make_battery_icon(size, state.0, state.1, state.2) };
+        let icon = unsafe { make_battery_icon(size, state.0, state.1, state.2, g) };
         tray_set(id, Some(icon), &tip, add);
         if let Some(old) = a.tray_batt.insert(key, TrayBatt { id, state, icon }) {
             unsafe { DestroyIcon(old.icon) };
@@ -2067,6 +2285,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             on_scanned(*list);
             0
         }
+        WM_QUIT_APP => {
+            DestroyWindow(hwnd);
+            0
+        }
         WM_UPD_INFO => {
             let r = *Box::from_raw(lp as *mut Result<Option<update::Release>, String>);
             a.upd = match r {
@@ -2148,9 +2370,14 @@ fn cli(args: &[String]) -> bool {
         let _ = std::fs::write(p, text);
     };
     match args.get(1).map(|s| s.as_str()) {
+        Some("--uninstall") => {
+            unsafe { uninstall() };
+            true
+        }
         // CentroLED --version salida.txt
         Some("--version") => {
-            out_file(args.get(2).map(|s| s.as_str()).unwrap_or("version.txt"), update::VERSION.to_string());
+            let mode = if portable_dir().is_some() { " portable" } else { "" };
+            out_file(args.get(2).map(|s| s.as_str()).unwrap_or("version.txt"), format!("{}{}", update::VERSION, mode));
             true
         }
         // CentroLED --check-update salida.txt
@@ -2206,6 +2433,122 @@ fn cli(args: &[String]) -> bool {
     }
 }
 
+/// Dibuja en un mapa de bits y lo guarda como .bmp.
+unsafe fn render_to_file(w: i32, h: i32, path: &str, draw: impl FnOnce(HDC)) {
+    let screen = GetDC(null_mut());
+    let dc = CreateCompatibleDC(screen);
+    let mut bmi: BITMAPINFO = std::mem::zeroed();
+    bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    let mut bits: *mut core::ffi::c_void = null_mut();
+    let bmp = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+    let old = SelectObject(dc, bmp);
+    SetBkMode(dc, TRANSPARENT as i32);
+    draw(dc);
+    GdiFlush();
+    let px = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize);
+    let mut out = Vec::with_capacity(54 + px.len());
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&(54 + px.len() as u32).to_le_bytes());
+    out.extend_from_slice(&[0, 0, 0, 0]);
+    out.extend_from_slice(&54u32.to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&w.to_le_bytes());
+    out.extend_from_slice(&(-h).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&32u16.to_le_bytes());
+    out.extend_from_slice(&[0u8; 24]);
+    out.extend_from_slice(px);
+    let _ = std::fs::write(path, out);
+    SelectObject(dc, old);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+    ReleaseDC(null_mut(), screen);
+}
+
+/// --render <clave> <pestaña> <salida.bmp> [modo]   |   --render-icons <salida.bmp>
+unsafe fn do_render(args: &[String]) {
+    let a = app();
+    if args[1] == "--render-icons" {
+        let samples: [(u8, bool, bool, &str); 5] = [(100, true, false, "\u{E7FC}"), (64, false, false, "\u{E7F6}"), (15, false, false, "\u{E962}"), (45, false, true, "\u{E765}"), (8, false, false, "\u{E702}")];
+        let sizes = [16, 20, 24, 32, 48];
+        let cell = 60;
+        let w = cell * samples.len() as i32;
+        let h = cell * sizes.len() as i32 * 2;
+        render_to_file(w, h, args.get(2).map(|s| s.as_str()).unwrap_or("icons.bmp"), |dc| {
+            for (row, &sz) in sizes.iter().enumerate() {
+                for (dark, bg) in [(0, rgb(0x20, 0x20, 0x20)), (1, rgb(0xF3, 0xF3, 0xF3))] {
+                    let y = (row as i32 * 2 + dark) * cell;
+                    let br = CreateSolidBrush(bg);
+                    FillRect(dc, &RECT { left: 0, top: y, right: w, bottom: y + cell }, br);
+                    DeleteObject(br);
+                    for (i, &(pct, ch, st, g)) in samples.iter().enumerate() {
+                        let icon = make_battery_icon(sz, pct, ch, st, g);
+                        DrawIconEx(dc, i as i32 * cell + (cell - sz) / 2, y + (cell - sz) / 2, icon, sz, sz, 0, null_mut(), DI_NORMAL);
+                        DestroyIcon(icon);
+                    }
+                }
+            }
+        });
+        return;
+    }
+    let key = args.get(2).cloned().unwrap_or_default();
+    a.devices = devices::scan();
+    let Some(i) = a.devices.iter().position(|d| d.key == key) else { return };
+    select_device(i);
+    a.tab = args.get(3).and_then(|t| t.parse().ok()).unwrap_or(0);
+    if let Some(m) = args.get(5).and_then(|m| m.parse().ok()) {
+        editing().mode = m;
+    }
+    let out = args.get(4).cloned().unwrap_or_else(|| "render.bmp".into());
+    render_to_file(s(WIN_W), s(WIN_H), &out, |dc| paint(&Painter { dc }));
+}
+
+/// Desinstala la versión instalada con el instalador (sólo si el programa está en su carpeta).
+unsafe fn uninstall() {
+    let title = wide("Centro LED");
+    if MessageBoxW(null_mut(), wide("¿Quieres desinstalar Centro LED?").as_ptr(), title.as_ptr(), MB_YESNO | MB_ICONQUESTION) != IDYES {
+        return;
+    }
+    // Cerrar la app si está abierta.
+    let h = FindWindowW(wide("CentroLEDWindow").as_ptr(), null());
+    if !h.is_null() {
+        PostMessageW(h, WM_QUIT_APP, 0, 0);
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+    }
+    set_autostart(false);
+    RegDeleteTreeW(HKEY_CURRENT_USER, wide(UNINSTALL_KEY).as_ptr());
+    let appdata = std::env::var_os("APPDATA").map(std::path::PathBuf::from).unwrap_or_default();
+    let _ = std::fs::remove_file(appdata.join("Microsoft\\Windows\\Start Menu\\Programs\\Centro LED.lnk"));
+    let mut desk: windows_sys::core::PWSTR = null_mut();
+    if SHGetKnownFolderPath(&FOLDERID_Desktop, 0, null_mut(), &mut desk) == 0 {
+        let mut n = 0;
+        while *desk.add(n) != 0 {
+            n += 1;
+        }
+        let d = String::from_utf16_lossy(std::slice::from_raw_parts(desk, n));
+        let _ = std::fs::remove_file(std::path::Path::new(&d).join("Centro LED.lnk"));
+        windows_sys::Win32::System::Com::CoTaskMemFree(desk as _);
+    }
+    if MessageBoxW(null_mut(), wide("¿Borrar también tu configuración de luces?").as_ptr(), title.as_ptr(), MB_YESNO | MB_ICONQUESTION) == IDYES {
+        let _ = std::fs::remove_dir_all(appdata.join(APP_NAME));
+    }
+    // Borrar la carpeta del programa cuando este proceso termine (sólo la carpeta de instalación).
+    if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())) {
+        if dir.to_string_lossy().to_lowercase().ends_with("programs\\centroled") {
+            use std::os::windows::process::CommandExt;
+            let _ = std::process::Command::new("cmd")
+                .args(["/c", &format!("ping -n 3 127.0.0.1 >nul & rmdir /s /q \"{}\"", dir.display())])
+                .creation_flags(0x0800_0000)
+                .spawn();
+        }
+    }
+    MessageBoxW(null_mut(), wide("Centro LED se ha desinstalado.").as_ptr(), title.as_ptr(), MB_OK | MB_ICONINFORMATION);
+}
+
 unsafe fn font(face: &str, px: i32, weight: i32, scale: f32) -> HFONT {
     let mut lf: LOGFONTW = std::mem::zeroed();
     lf.lfHeight = -((px as f32 * scale).round() as i32);
@@ -2230,11 +2573,15 @@ fn main() {
         return;
     }
     let start_hidden = args.iter().any(|a| a == "--tray");
+    // Dibujar la interfaz o los iconos en una imagen, sin mostrar nada (para revisar el diseño).
+    let render = matches!(args.get(1).map(|s| s.as_str()), Some("--render") | Some("--render-icons"));
     unsafe {
-        let class = wide("CentroLEDWindow");
-        update::cleanup();
+        let class = wide(if render { "CentroLEDRender" } else { "CentroLEDWindow" });
         let updated = args.iter().any(|a| a == "--updated");
-        let mut mutex = CreateMutexW(null(), 0, wide("CentroLED_SingleInstance").as_ptr());
+        let mut mutex: HANDLE = null_mut();
+        if !render {
+            update::cleanup();
+            mutex = CreateMutexW(null(), 0, wide("CentroLED_SingleInstance").as_ptr());
         // Tras actualizar, esperar a que la versión anterior termine de cerrarse.
         let mut tries = 0;
         while updated && GetLastError() == ERROR_ALREADY_EXISTS && tries < 50 {
@@ -2251,6 +2598,7 @@ fn main() {
                 SetForegroundWindow(h);
             }
             return;
+        }
         }
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE);
         let scale = GetDpiForSystem() as f32 / 96.0;
@@ -2296,6 +2644,8 @@ fn main() {
             keys: Box::new([[0x69, 0, 0xFF]; KB_LEDS]),
             cycle: Vec::new(),
             cyclers: HashMap::new(),
+            zones: Vec::new(),
+            pad: PadExtra::default(),
             dirty: false,
             config: load_config(),
             known: HashSet::new(),
@@ -2340,6 +2690,17 @@ fn main() {
             null(),
         );
         app().hwnd = hwnd;
+        if render {
+            do_render(&args);
+            return;
+        }
+        // Versión instalada: mantener al día la versión que muestra "Aplicaciones instaladas".
+        let mut ukey: HKEY = null_mut();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, wide(UNINSTALL_KEY).as_ptr(), 0, KEY_SET_VALUE, &mut ukey) == 0 {
+            let v = wide(update::VERSION);
+            RegSetValueExW(ukey, wide("DisplayVersion").as_ptr(), 0, REG_SZ, v.as_ptr() as *const u8, (v.len() * 2) as u32);
+            RegCloseKey(ukey);
+        }
         // Si el inicio automático apunta a otra copia del programa (se movió el .exe), corregirlo.
         if let (Some(v), Ok(exe)) = (autostart_value(), std::env::current_exe()) {
             if !v.to_lowercase().contains(&exe.display().to_string().to_lowercase()) {

@@ -91,8 +91,20 @@ fn json_str<'a>(json: &'a str, key: &str, from: usize) -> Option<(&'a str, usize
     Some((&json[q1..q2], q2))
 }
 
+/// Descarga un archivo por HTTPS (lo usa el instalador).
+#[allow(dead_code)]
+pub fn download(url: &str) -> Result<Vec<u8>, String> {
+    https_get(url)
+}
+
 /// Última versión publicada, si es más nueva que la que está en marcha.
 pub fn check() -> Result<Option<Release>, String> {
+    let rel = latest()?;
+    Ok((parse_version(&rel.version) > parse_version(VERSION)).then_some(rel))
+}
+
+/// Última versión publicada en GitHub (sea o no más nueva).
+pub fn latest() -> Result<Release, String> {
     let body = https_get(&format!("https://api.github.com/repos/{REPO}/releases/latest"))?;
     let json = String::from_utf8_lossy(&body);
     let (tag, _) = json_str(&json, "tag_name", 0).ok_or("Respuesta de GitHub no válida")?;
@@ -100,18 +112,14 @@ pub fn check() -> Result<Option<Release>, String> {
     let mut pos = 0;
     let mut url = None;
     while let Some((u, end)) = json_str(&json, "browser_download_url", pos) {
-        if u.ends_with(EXE_NAME) {
+        if u.ends_with(&format!("/{EXE_NAME}")) {
             url = Some(u.to_string());
             break;
         }
         pos = end;
     }
     let url = url.ok_or("La release no incluye el ejecutable")?;
-    if parse_version(tag) > parse_version(VERSION) {
-        Ok(Some(Release { version: tag.trim_start_matches('v').to_string(), url }))
-    } else {
-        Ok(None)
-    }
+    Ok(Release { version: tag.trim_start_matches('v').to_string(), url })
 }
 
 /// Descarga la versión nueva y la pone en lugar del ejecutable actual

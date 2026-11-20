@@ -17,6 +17,14 @@ pub struct Battery {
 pub const MODE_OFF: u8 = 0xFF;
 /// Modo "ciclo suave": la app va fundiendo los colores elegidos (sólo mandos).
 pub const MODE_CYCLE: u8 = 0xF0;
+/// Respiración y arcoíris animados por la app (mandos).
+pub const MODE_SW_BREATH: u8 = 0xF1;
+pub const MODE_SW_RAINBOW: u8 = 0xF2;
+
+/// ¿El modo lo anima la app (en vez del propio dispositivo)?
+pub fn is_app_animated(mode: u8) -> bool {
+    matches!(mode, MODE_CYCLE | MODE_SW_BREATH | MODE_SW_RAINBOW)
+}
 
 #[derive(Clone, Debug)]
 pub struct LedCaps {
@@ -25,6 +33,41 @@ pub struct LedCaps {
     pub multicolor: bool,
     /// Las luces se pierden al desconectar: se reaplican automáticamente.
     pub volatile: bool,
+    /// Zonas con luz independiente (vacío = una sola zona).
+    pub zones: Vec<String>,
+    /// LEDs de jugador y de micrófono (DualSense).
+    pub pad_extras: bool,
+}
+
+/// Luces secundarias del DualSense.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PadExtra {
+    /// Bits 0..4: los 5 LEDs blancos de jugador (de izquierda a derecha).
+    pub player: u8,
+    /// Brillo de los LEDs de jugador: 0 alto, 1 medio, 2 bajo.
+    pub player_bright: u8,
+    /// LED del micrófono: 0 apagado, 1 encendido, 2 parpadeando.
+    pub mic: u8,
+}
+
+impl Default for PadExtra {
+    fn default() -> Self {
+        PadExtra { player: 0b00100, player_bright: 1, mic: 0 }
+    }
+}
+
+/// Ajustes adicionales según el tipo de dispositivo.
+#[derive(Clone)]
+pub enum Extra {
+    Keyboard(KbExtra),
+    Zones(Vec<LedSetting>),
+    Pad(PadExtra),
+}
+
+/// Efectos de una zona Logitech: (id de efecto, índice en la lista del dispositivo).
+#[derive(Clone, Debug)]
+pub struct LogiZone {
+    pub effects: Vec<(u16, u8)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -41,7 +84,7 @@ pub enum Driver {
     Tempest { path: Vec<u16> },
     DualSense { path: Vec<u16>, bt: bool },
     DualShock4 { path: Vec<u16>, bt: bool },
-    Logitech { path: Vec<u16>, idx: u8, led_feat: u8, zones: u8 },
+    Logitech { path: Vec<u16>, idx: u8, led_feat: u8, zones: Vec<LogiZone> },
     None,
 }
 
@@ -75,7 +118,7 @@ pub fn scan() -> Vec<Device> {
             conn: "USB",
             battery: None,
             battery_note: "Con cable",
-            led: Some(LedCaps { modes: TEMPEST_MODES.to_vec(), speed: true, multicolor: true, volatile: false }),
+            led: Some(LedCaps { modes: TEMPEST_MODES.to_vec(), speed: true, multicolor: true, volatile: false, zones: vec![], pad_extras: false }),
             driver: Driver::Tempest { path: i.path.clone() },
         });
     }
@@ -102,7 +145,20 @@ pub fn scan() -> Vec<Device> {
             conn: if bt { "Bluetooth" } else { "USB" },
             battery,
             battery_note: "Sin datos",
-            led: Some(LedCaps { modes: vec![("Estático", 1), ("Ciclo suave", MODE_CYCLE), ("Apagado", MODE_OFF)], speed: true, multicolor: false, volatile: true }),
+            led: Some(LedCaps {
+                modes: vec![
+                    ("Estático", 1),
+                    ("Respiración", MODE_SW_BREATH),
+                    ("Ciclo suave", MODE_CYCLE),
+                    ("Arcoíris", MODE_SW_RAINBOW),
+                    ("Apagado", MODE_OFF),
+                ],
+                speed: true,
+                multicolor: false,
+                volatile: true,
+                zones: vec![],
+                pad_extras: ds5,
+            }),
             driver,
         });
     }
@@ -197,15 +253,27 @@ pub struct KbExtra {
     pub keys: Box<[[u8; 3]; KB_LEDS]>,
 }
 
-pub fn apply(dev: &Device, s: &LedSetting, kb: Option<&KbExtra>) -> Result<(), String> {
+pub fn apply(dev: &Device, s: &LedSetting, extra: Option<&Extra>) -> Result<(), String> {
     match &dev.driver {
-        Driver::Tempest { path } => match kb {
+        Driver::Tempest { path } => match extra {
             // Dos escrituras: la primera fija el modo de las teclas y la segunda el del borde.
-            Some(x) => tempest_apply_full(path, s, Some(&x.keys)).and_then(|_| tempest_apply_full(path, &x.rim, Some(&x.keys))),
-            None => tempest_apply_full(path, s, None),
+            Some(Extra::Keyboard(x)) => tempest_apply_full(path, s, Some(&x.keys)).and_then(|_| tempest_apply_full(path, &x.rim, Some(&x.keys))),
+            _ => tempest_apply_full(path, s, None),
         },
-        Driver::DualSense { .. } | Driver::DualShock4 { .. } => ps_apply(dev, s),
-        Driver::Logitech { path, idx, led_feat, zones } => logitech_apply(path, *idx, *led_feat, *zones, s),
+        Driver::DualSense { .. } | Driver::DualShock4 { .. } => {
+            let lb = Lightbar::open(dev)?;
+            if let Some(Extra::Pad(px)) = extra {
+                lb.set_extras(px);
+            }
+            if lb.set(scaled(s)) { Ok(()) } else { Err("El mando no aceptó el color".into()) }
+        }
+        Driver::Logitech { path, idx, led_feat, zones } => {
+            let per_zone: Vec<LedSetting> = match extra {
+                Some(Extra::Zones(z)) => (0..zones.len()).map(|i| z.get(i).copied().unwrap_or(*s)).collect(),
+                _ => vec![*s; zones.len()],
+            };
+            logitech_apply(path, *idx, *led_feat, zones, &per_zone)
+        }
         Driver::None => Err("Este dispositivo no tiene luces controlables".into()),
     }
 }
@@ -504,6 +572,32 @@ impl Lightbar {
         buf
     }
 
+    /// LEDs de jugador, su brillo y el LED del micrófono (sólo DualSense).
+    pub fn set_extras(&self, x: &PadExtra) -> bool {
+        if !self.ds5 {
+            return true;
+        }
+        let mut buf = vec![0u8; if self.bt { 78 } else { 48 }];
+        let c = if self.bt {
+            buf[0] = 0x31;
+            buf[2] = 0x10;
+            3
+        } else {
+            buf[0] = 0x02;
+            1
+        };
+        buf[c + 1] = 0x01 | 0x10; // valid_flag1: LED de micrófono + LEDs de jugador
+        buf[c + 38] = 0x01; // valid_flag2: brillo de los LEDs
+        buf[c + 8] = x.mic.min(2);
+        buf[c + 42] = x.player_bright.min(2);
+        buf[c + 43] = x.player & 0x1F;
+        if self.bt {
+            let crc = crc32(0xA2, &buf[..74]);
+            buf[74..78].copy_from_slice(&crc.to_le_bytes());
+        }
+        self.dev.write(&buf)
+    }
+
     pub fn set(&self, (r, g, b): (u8, u8, u8)) -> bool {
         let buf = if self.ds5 {
             self.ds5_report(Some((r, g, b)))
@@ -529,11 +623,6 @@ impl Lightbar {
         };
         self.dev.write(&buf)
     }
-}
-
-fn ps_apply(d: &Device, s: &LedSetting) -> Result<(), String> {
-    let lb = Lightbar::open(d)?;
-    if lb.set(scaled(s)) { Ok(()) } else { Err("El mando no aceptó el color".into()) }
 }
 
 fn ds4_battery(i: &HidInfo, bt: bool) -> Option<Battery> {
@@ -673,12 +762,24 @@ fn logitech_probe(i: &HidInfo) -> Vec<Device> {
         let mut led = None;
         let mut driver = Driver::None;
         if let Some(f) = feature_index(&dev, idx, 0x8070) {
-            let zones = hidpp(&dev, idx, f, 0, &[]).map(|r| r[0]).unwrap_or(1).clamp(1, 8);
+            let (zones, names) = logitech_zones(&dev, idx, f);
+            // Efectos comunes a todas las zonas, en un orden fijo.
+            let mut modes: Vec<(&'static str, u8)> = Vec::new();
+            for &(id, name) in LOGI_EFFECTS {
+                if zones.iter().all(|z| z.effects.iter().any(|e| e.0 == id)) {
+                    modes.push((name, if id == 0 { MODE_OFF } else { id as u8 }));
+                }
+            }
+            if !modes.iter().any(|m| m.1 == MODE_OFF) {
+                modes.push(("Apagado", MODE_OFF));
+            }
             led = Some(LedCaps {
-                modes: vec![("Estático", 1), ("Respiración", 2), ("Apagado", MODE_OFF)],
+                modes,
                 speed: true,
                 multicolor: false,
                 volatile: true,
+                zones: if zones.len() > 1 { names } else { vec![] },
+                pad_extras: false,
             });
             driver = Driver::Logitech { path: i.path.clone(), idx, led_feat: f, zones };
         }
@@ -696,29 +797,101 @@ fn logitech_probe(i: &HidInfo) -> Vec<Device> {
     out
 }
 
-fn logitech_apply(path: &[u16], idx: u8, feat: u8, zones: u8, s: &LedSetting) -> Result<(), String> {
+/// Efectos de iluminación Logitech (feature 0x8070) que sabemos configurar.
+const LOGI_EFFECTS: &[(u16, &str)] = &[
+    (0x01, "Estático"),
+    (0x0A, "Respiración"),
+    (0x02, "Pulso"),
+    (0x03, "Ciclo de color"),
+    (0x0B, "Ondas"),
+    (0x0E, "Descomposición"),
+    (0x00, "Apagado"),
+];
+
+fn zone_name(location: u16, n: usize) -> String {
+    match location {
+        0x01 => "Principal".into(),
+        0x02 => "Logo".into(),
+        0x03 => "Lado izquierdo".into(),
+        0x04 => "Lado derecho".into(),
+        0x05 => "Combinada".into(),
+        _ => format!("Zona {}", n + 1),
+    }
+}
+
+/// Lee las zonas de luz y los efectos que admite cada una. Si el dispositivo no
+/// responde a la consulta detallada, usa la distribución conocida (apagado/estático/respiración).
+fn logitech_zones(dev: &HidDev, idx: u8, f: u8) -> (Vec<LogiZone>, Vec<String>) {
+    let count = hidpp(dev, idx, f, 0, &[]).map(|r| r[0]).unwrap_or(1).clamp(1, 8);
+    let mut zones = Vec::new();
+    let mut names = Vec::new();
+    for z in 0..count {
+        let mut effects = Vec::new();
+        let mut location = 0;
+        if let Some(info) = hidpp(dev, idx, f, 1, &[z]) {
+            location = u16::from_be_bytes([info[1], info[2]]);
+            for e in 0..info[3].min(16) {
+                if let Some(r) = hidpp(dev, idx, f, 2, &[z, e]) {
+                    effects.push((u16::from_be_bytes([r[2], r[3]]), e));
+                }
+            }
+        }
+        if effects.is_empty() {
+            effects = vec![(0x00, 0), (0x01, 1), (0x0A, 2)];
+        }
+        names.push(zone_name(location, z as usize));
+        zones.push(LogiZone { effects });
+    }
+    // Nombres repetidos (p. ej. dos "Principal"): numerarlos.
+    for i in 0..names.len() {
+        if names.iter().filter(|n| **n == names[i]).count() > 1 {
+            names[i] = format!("Zona {}", i + 1);
+        }
+    }
+    (zones, names)
+}
+
+fn logitech_apply(path: &[u16], idx: u8, feat: u8, zones: &[LogiZone], per_zone: &[LedSetting]) -> Result<(), String> {
     let dev = HidDev::open(path).ok_or("No se pudo abrir el dispositivo Logitech")?;
-    let full = scaled(&LedSetting { bright: 100, ..*s });
-    let dim = scaled(s);
-    let intensity = s.bright.max(1);
-    // Periodo de respiración: 1,5 s (rápido) .. 8 s (lento)
-    let period = (8000 - (s.speed as u32 * 65)) as u16;
-    for zone in 0..zones {
+    for (z, zone) in zones.iter().enumerate() {
+        let s = per_zone[z];
+        let id: u16 = if s.mode == MODE_OFF { 0 } else { s.mode as u16 };
+        let Some(&(_, index)) = zone.effects.iter().find(|e| e.0 == id) else {
+            return Err("Efecto no disponible en esta zona".into());
+        };
+        let full = scaled(&LedSetting { bright: 100, ..s });
+        let dim = scaled(&s);
+        let intensity = s.bright.max(1);
+        // Periodo: de 8 s (lento) a 1,5 s (rápido)
+        let period = ((8000 - s.speed as u32 * 65) as u16).to_be_bytes();
         let mut p = [0u8; 13];
-        p[0] = zone;
-        match s.mode {
-            MODE_OFF => p[1] = 0x00,
-            1 => {
-                p[1] = 0x01;
-                p[2..5].copy_from_slice(&[dim.0, dim.1, dim.2]);
+        p[0] = z as u8;
+        p[1] = index;
+        let prm = &mut p[2..12];
+        match id {
+            0x01 => prm[..3].copy_from_slice(&[dim.0, dim.1, dim.2]),
+            0x0A => {
+                prm[..3].copy_from_slice(&[full.0, full.1, full.2]);
+                prm[3..5].copy_from_slice(&period);
+                prm[6] = intensity;
             }
-            _ => {
-                p[1] = 0x02;
-                p[2..5].copy_from_slice(&[full.0, full.1, full.2]);
-                p[5..7].copy_from_slice(&period.to_be_bytes());
-                p[7] = 0x00;
-                p[8] = intensity;
+            0x02 => {
+                prm[..3].copy_from_slice(&[full.0, full.1, full.2]);
+                prm[3] = (s.speed as u32 * 255 / 100) as u8;
             }
+            0x03 => {
+                prm[5..7].copy_from_slice(&period);
+                prm[7] = intensity;
+            }
+            0x0B => {
+                prm[..3].copy_from_slice(&[full.0, full.1, full.2]);
+                prm[4..6].copy_from_slice(&period);
+            }
+            0x0E => {
+                prm[6..8].copy_from_slice(&period);
+                prm[8] = intensity;
+            }
+            _ => {}
         }
         if hidpp(&dev, idx, feat, 3, &p).is_none() {
             return Err("Los cascos no aceptaron el efecto (¿están encendidos?)".into());
@@ -850,15 +1023,27 @@ fn bluetooth_batteries() -> Vec<Device> {
             if n.is_empty() || out.iter().any(|d| d.name == n) {
                 continue;
             }
+            // Tipo: primero la clase que asigna Windows al dispositivo, después el nombre.
+            let mut class = [0u16; 64];
+            SetupDiGetDeviceRegistryPropertyW(set, &data, SPDRP_CLASS, std::ptr::null_mut(), class.as_mut_ptr() as _, 128, std::ptr::null_mut());
+            let cend = class.iter().position(|&c| c == 0).unwrap_or(0);
+            let class = String::from_utf16_lossy(&class[..cend]).to_lowercase();
             let l = n.to_lowercase();
-            let kind = if ["buds", "head", "auricular", "casco", "airpods", "wh-", "wf-"].iter().any(|k| l.contains(k)) {
+            let has = |words: &[&str]| words.iter().any(|k| l.contains(k));
+            let kind = if class == "audioendpoint" || class == "media" || has(&["buds", "head", "auricular", "casco", "airpods", "wh-", "wf-", "earphone", "speaker", "altavoz"]) {
                 "Cascos"
-            } else if l.contains("mouse") || l.contains("ratón") {
+            } else if class == "mouse" || has(&["mouse", "ratón", "raton", "mx ", "trackball"]) {
                 "Ratón"
-            } else if l.contains("keyboard") || l.contains("teclado") {
+            } else if class == "keyboard" || has(&["keyboard", "teclado", "keys"]) {
                 "Teclado"
-            } else if l.contains("controller") || l.contains("mando") {
+            } else if has(&["controller", "mando", "gamepad", "dualsense", "dualshock", "joy-con", "xbox", "8bitdo"]) {
                 "Mando"
+            } else if has(&["pen", "lápiz", "stylus"]) {
+                "Lápiz"
+            } else if has(&["watch", "reloj", "band"]) {
+                "Reloj"
+            } else if has(&["phone", "móvil", "galaxy", "iphone", "pixel"]) {
+                "Móvil"
             } else {
                 "Bluetooth"
             };
