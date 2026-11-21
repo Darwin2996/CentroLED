@@ -3,6 +3,9 @@
 //! La interfaz se dibuja a mano con GDI (sin controles estándar ni motores web).
 
 mod devices;
+mod diag;
+mod history;
+mod state;
 mod generic;
 mod headsets;
 mod nintendo;
@@ -23,11 +26,13 @@ use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Registry::*;
-use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, SetProcessWorkingSetSize};
+use windows_sys::Win32::System::Power::{RegisterPowerSettingNotification, POWERBROADCAST_SETTING};
+use windows_sys::Win32::System::RemoteDesktop::WTSRegisterSessionNotification;
+use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, SetPriorityClass, SetProcessWorkingSetSize, NORMAL_PRIORITY_CLASS};
 use windows_sys::Win32::UI::Controls::Dialogs::*;
 use windows_sys::Win32::UI::Controls::TTTOOLINFOW;
 use windows_sys::Win32::UI::HiDpi::*;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -40,12 +45,17 @@ const WM_APPLIED: u32 = WM_APP + 3;
 const MENU_OPEN: usize = 1;
 const MENU_SCAN: usize = 2;
 const MENU_EXIT: usize = 3;
+const MENU_TOGGLE: usize = 4;
 const TIMER_BATTERY: usize = 1;
 const TIMER_DEVCHANGE: usize = 2;
 const TIMER_ANIM: usize = 3;
 const TIMER_PROMOTE: usize = 4;
 const TIMER_UPDATE: usize = 5;
 const TIMER_WIDGET: usize = 6;
+/// Tras volver de la suspensión, esperar a que los dispositivos se reconecten.
+const TIMER_RESUME: usize = 7;
+/// Reintentar el icono de la bandeja si el explorador aún no estaba listo (arranque rápido).
+const TIMER_TRAY: usize = 8;
 const WM_UPD_INFO: u32 = WM_APP + 4;
 const WM_UPD_DONE: u32 = WM_APP + 5;
 /// Petición de cierre real (la usa el desinstalador).
@@ -57,6 +67,9 @@ const APP_NAME: &str = "CentroLED";
 const WIN_W: i32 = 1100;
 const WIN_H: i32 = 720;
 const SIDEBAR_W: i32 = 284;
+const WIN_STYLE: u32 = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+/// Avisa de que la pantalla se apaga o se enciende.
+const GUID_CONSOLE_DISPLAY_STATE: windows_sys::core::GUID = windows_sys::core::GUID::from_u128(0x6fe69556_704a_47a0_8f24_c28d936fda47);
 
 // ------------------------------------------------------------------ tema
 
@@ -153,6 +166,20 @@ enum Act {
     Widget,
     LowBattery(u8),
     OpenUrl,
+    Profile(usize),
+    ProfileSave,
+    ProfileMore(usize),
+    AllColor([u8; 3]),
+    AllToggle,
+    DevProfiles,
+    HistToggle,
+    HistRange(u8),
+    AutoOpt(u8),
+    AutoDev(usize),
+    HkRecord(usize),
+    HkClear(usize),
+    Diagnostics,
+    FastStart,
 }
 
 struct Fonts {
@@ -181,6 +208,24 @@ struct Config {
     /// Umbral del aviso de batería baja (0 = desactivado).
     low_battery: u8,
     pads: HashMap<String, PadExtra>,
+    /// Perfiles globales: el estado de luces de varios dispositivos.
+    profiles: Vec<state::Profile>,
+    /// Perfiles propios de cada dispositivo.
+    dprofiles: HashMap<String, Vec<(String, state::DevState)>>,
+    /// Estado de antes de "Apagar todo" (vacío si las luces no están apagadas así).
+    off_backup: Vec<(String, state::DevState)>,
+    active_profile: String,
+    /// Apagado automático: al bloquear, al apagarse la pantalla, al suspender, al apagar el equipo.
+    auto: [bool; 4],
+    /// Dispositivos que no se apagan solos.
+    auto_exclude: HashSet<String>,
+    hotkeys: Vec<state::Hotkey>,
+    /// Inicio con una tarea programada (sin el retraso de Windows y con más prioridad).
+    fast_start: bool,
+    /// Ya se crearon los perfiles de ejemplo.
+    seeded: bool,
+    /// Se apagaron las luces al apagar el equipo: devolverlas al arrancar.
+    pending_restore: bool,
 }
 
 /// Hilo que funde suavemente los colores del ciclo en un mando.
@@ -245,6 +290,23 @@ struct App {
     home_max: i32,
     widgets: Vec<Widget>,
     widget_drag: Option<(i32, i32, bool)>,
+    /// Motivos activos del apagado automático (bloqueo, pantalla, suspensión).
+    auto_off: u8,
+    /// Dispositivos con luces cambiadas mientras estaban desconectados.
+    pending: HashSet<String>,
+    /// Acción cuyo atajo se está grabando.
+    recording: Option<String>,
+    hk_ids: Vec<i32>,
+    hk_failed: HashSet<String>,
+    set_scroll: i32,
+    set_max: i32,
+    /// Las zonas de clic se recortan a esta zona (páginas con desplazamiento).
+    clip: Option<RECT>,
+    hist: HashMap<String, Vec<history::Rec>>,
+    hist_days: u64,
+    /// Página del dispositivo: mostrar el historial de batería en vez de las luces.
+    show_hist: bool,
+    first_scan: bool,
 }
 
 /// Widget de batería colocado sobre la barra de tareas de una pantalla secundaria.
@@ -327,12 +389,42 @@ fn load_config() -> Config {
                 "hide_widget" => cfg.hide_widget = f[2] == "1",
                 "widget_offset" => cfg.widget_offset = f[2].parse().unwrap_or(110),
                 "low_battery" => cfg.low_battery = f[2].parse().unwrap_or(15),
+                "auto_lock" => cfg.auto[0] = f[2] == "1",
+                "auto_display" => cfg.auto[1] = f[2] == "1",
+                "auto_sleep" => cfg.auto[2] = f[2] == "1",
+                "auto_shutdown" => cfg.auto[3] = f[2] == "1",
+                "fast_start" => cfg.fast_start = f[2] == "1",
+                "profile" => cfg.active_profile = f[2].to_string(),
+                "seeded" => cfg.seeded = f[2] == "1",
+                "pending_restore" => cfg.pending_restore = f[2] == "1",
                 _ => {}
             }
         } else if f.len() == 3 && f[0] == "#cycle" {
             let list: Vec<[u8; 3]> = (0..f[2].len() / 6).filter_map(|i| parse_rgb(&f[2][i * 6..i * 6 + 6])).collect();
             if list.len() >= 2 {
                 cfg.cycles.insert(f[1].to_string(), list);
+            }
+        } else if f.len() >= 2 && f[0] == "#prof" {
+            let name = f[1].to_string();
+            let i = match cfg.profiles.iter().position(|p| p.name == name) {
+                Some(i) => i,
+                None => {
+                    cfg.profiles.push(state::Profile { name, devs: Vec::new() });
+                    cfg.profiles.len() - 1
+                }
+            };
+            if f.len() == 4 {
+                cfg.profiles[i].devs.push((f[2].to_string(), state::DevState::from_text(f[3])));
+            }
+        } else if f.len() == 4 && f[0] == "#dprof" {
+            cfg.dprofiles.entry(f[1].to_string()).or_default().push((f[2].to_string(), state::DevState::from_text(f[3])));
+        } else if f.len() == 3 && f[0] == "#off" {
+            cfg.off_backup.push((f[1].to_string(), state::DevState::from_text(f[2])));
+        } else if f.len() == 2 && f[0] == "#noauto" {
+            cfg.auto_exclude.insert(f[1].to_string());
+        } else if f.len() == 4 && f[0] == "#hk" {
+            if let (Ok(mods), Ok(vk)) = (f[2].parse(), f[3].parse()) {
+                cfg.hotkeys.push(state::Hotkey { action: f[1].to_string(), mods, vk });
             }
         } else if f.len() == 6 {
             let n = |s: &str| s.parse::<u8>().ok();
@@ -366,7 +458,40 @@ fn save_config(cfg: &Config) {
     text += &format!("#opt\thide_widget\t{}\n", cfg.hide_widget as u8);
     text += &format!("#opt\twidget_offset\t{}\n", cfg.widget_offset);
     text += &format!("#opt\tlow_battery\t{}\n", cfg.low_battery);
-    let _ = std::fs::write(path, text);
+    for (i, n) in ["auto_lock", "auto_display", "auto_sleep", "auto_shutdown"].iter().enumerate() {
+        text += &format!("#opt\t{}\t{}\n", n, cfg.auto[i] as u8);
+    }
+    text += &format!("#opt\tfast_start\t{}\n", cfg.fast_start as u8);
+    text += &format!("#opt\tprofile\t{}\n", cfg.active_profile);
+    text += &format!("#opt\tseeded\t{}\n", cfg.seeded as u8);
+    text += &format!("#opt\tpending_restore\t{}\n", cfg.pending_restore as u8);
+    for p in &cfg.profiles {
+        if p.devs.is_empty() {
+            text += &format!("#prof\t{}\n", p.name);
+        }
+        for (k, st) in &p.devs {
+            text += &format!("#prof\t{}\t{}\t{}\n", p.name, k, st.to_text());
+        }
+    }
+    for (k, list) in &cfg.dprofiles {
+        for (n, st) in list {
+            text += &format!("#dprof\t{}\t{}\t{}\n", k, n, st.to_text());
+        }
+    }
+    for (k, st) in &cfg.off_backup {
+        text += &format!("#off\t{}\t{}\n", k, st.to_text());
+    }
+    for k in &cfg.auto_exclude {
+        text += &format!("#noauto\t{}\n", k);
+    }
+    for h in &cfg.hotkeys {
+        text += &format!("#hk\t{}\t{}\t{}\n", h.action, h.mods, h.vk);
+    }
+    // Escribir aparte y luego sustituir: un corte a mitad no deja la configuración a medias.
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 fn default_setting(dev: &Device) -> LedSetting {
@@ -459,7 +584,7 @@ fn start_apply(dev: Device, st: LedSetting, extra: Option<Extra>, silent: bool) 
             devices::apply(&dev, &st, extra.as_ref())
         };
         let msg = match res {
-            Ok(()) if silent => format!("Luces restauradas en {}", dev.name),
+            Ok(()) if silent => String::new(),
             Ok(()) => format!("✓ Guardado en {}", dev.name),
             Err(e) => format!("{}: {}", dev.name, e),
         };
@@ -559,6 +684,7 @@ fn select_device(i: usize) {
     a.sel = Some(d.key.clone());
     a.tab = 0;
     a.dirty = false;
+    a.show_hist = false;
     a.cur = a.config.led.get(&d.key).copied().unwrap_or_else(|| default_setting(&d));
     a.rim = a
         .config
@@ -578,20 +704,6 @@ fn select_device(i: usize) {
         PadExtra::default()
     });
     redraw();
-}
-
-/// Datos extra guardados de un dispositivo (zonas o LEDs del mando) para reaplicarlos.
-fn saved_extra(d: &Device) -> Option<Extra> {
-    let a = app();
-    let caps = d.led.as_ref()?;
-    if !caps.zones.is_empty() {
-        let base = a.config.led.get(&d.key).copied()?;
-        return Some(Extra::Zones((0..caps.zones.len()).map(|i| a.config.led.get(&format!("{}#z{}", d.key, i)).copied().unwrap_or(base)).collect()));
-    }
-    if caps.pad_extras {
-        return a.config.pads.get(&d.key).map(|p| Extra::Pad(*p));
-    }
-    None
 }
 
 /// Ajuste que se está editando: la zona de la pestaña elegida, el borde del teclado o el principal.
@@ -614,6 +726,9 @@ fn on_apply() {
         return;
     }
     let caps = d.led.clone().unwrap();
+    // Un cambio a mano deja de seguir el perfil activo y saca al dispositivo de "Apagar todo".
+    a.config.active_profile.clear();
+    a.config.off_backup.retain(|(k, _)| k != &d.key);
     if !a.zones.is_empty() {
         a.cur = a.zones[0];
         for (i, z) in a.zones.iter().enumerate() {
@@ -793,10 +908,17 @@ impl Painter {
 }
 
 fn hit(r: RECT, act: Act) {
-    if app().partial {
+    let a = app();
+    if a.partial {
         return;
     }
-    app().hits.push((r, act));
+    let r = match a.clip {
+        Some(c) => RECT { left: r.left.max(c.left), top: r.top.max(c.top), right: r.right.min(c.right), bottom: r.bottom.min(c.bottom) },
+        None => r,
+    };
+    if r.bottom > r.top && r.right > r.left {
+        a.hits.push((r, act));
+    }
 }
 
 fn is_hot(act: Act) -> bool {
@@ -991,12 +1113,13 @@ fn paint_home(p: &Painter, x: i32, w: i32) {
         a.status.clone()
     };
     p.text(&sub, &p.rect(x, 58, w, 20), SUB, a.fonts.body, DT_SINGLELINE | DT_END_ELLIPSIS);
+    paint_home_bar(p, x, w);
 
     let cols = 3;
     let gap = 16;
     let cw = (w - gap * (cols - 1)) / cols;
     let ch = 140;
-    let view_top = 100;
+    let view_top = 152;
     let view_bottom = WIN_H - 16;
     let view = p.rect(x - 8, view_top, w + 16, view_bottom - view_top);
     let rows = (a.devices.len() as i32 + cols - 1) / cols;
@@ -1035,8 +1158,9 @@ fn paint_home(p: &Painter, x: i32, w: i32) {
             Some((pct, charging, stale)) => {
                 let col = if stale { mix(LINE, battery_color(pct), 0.45) } else { battery_color(pct) };
                 p.text(&format!("{} %", pct), &p.rect(cx + 16, by, 120, 30), TEXT, a.fonts.h2, DT_SINGLELINE | DT_VCENTER);
-                let note = if charging { "cargando ⚡" } else if stale { "último valor · dormido" } else { "batería" };
-                p.text(note, &p.rect(cx + 100, by, cw - 116, 30), SUB, a.fonts.small, DT_SINGLELINE | DT_VCENTER | DT_RIGHT);
+                let est = if stale { None } else { history::estimate_text(d) };
+                let note = est.unwrap_or_else(|| (if charging { "cargando ⚡" } else if stale { "último valor · dormido" } else { "batería" }).to_string());
+                p.text(&note, &p.rect(cx + 84, by, cw - 100, 30), SUB, a.fonts.small, DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_END_ELLIPSIS);
                 p.fill(&p.rect(cx + 16, by + 36, cw - 32, 8), LINE, 4);
                 p.fill(&p.rect(cx + 16, by + 36, ((cw - 32) * pct as i32 / 100).max(8), 8), col, 4);
             }
@@ -1069,6 +1193,61 @@ fn paint_home(p: &Painter, x: i32, w: i32) {
     }
 }
 
+/// Botón redondeado con texto (chip). Devuelve su ancho lógico.
+fn chip(p: &Painter, label: &str, x: i32, y: i32, h: i32, on: bool, act: Act) -> i32 {
+    chip_bg(p, label, x, y, h, on, act, CARD)
+}
+
+/// Igual que `chip` pero sobre otro fondo (dentro de una tarjeta se usa LINE para que se vea).
+fn chip_bg(p: &Painter, label: &str, x: i32, y: i32, h: i32, on: bool, act: Act, bg: u32) -> i32 {
+    let a = app();
+    let tw = p.measure(label, a.fonts.body) + 28;
+    let r = p.rect(x, y, tw, h);
+    let hot = if bg == LINE { rgb(0x44, 0x44, 0x58) } else { CARD_HOT };
+    p.fill(&r, if on { ACCENT } else if is_hot(act) { hot } else { bg }, h / 2);
+    p.text(label, &r, TEXT, a.fonts.body, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    hit(r, act);
+    tw
+}
+
+/// Barra de la página de inicio: perfiles a la izquierda y "todas las luces" a la derecha.
+fn paint_home_bar(p: &Painter, x: i32, w: i32) {
+    let a = app();
+    let ty = 92;
+    let lit = a.devices.iter().any(|d| d.led.is_some());
+    const ALL: [[u8; 3]; 7] = [[0xFF, 0, 0], [0xFF, 0x6A, 0], [0xFF, 0xD5, 0], [0, 0xFF, 0x40], [0, 0xA2, 0xFF], [0x69, 0, 0xFF], [0xFF, 0xFF, 0xFF]];
+    let btn = if state::all_lights_off() { "Encender todo" } else { "Apagar todo" };
+    let bw = p.measure(btn, a.fonts.body) + 28;
+    let rx = x + w - (ALL.len() as i32 * 30 + 10 + bw);
+    if lit {
+        section(p, "TODAS LAS LUCES", rx, ty);
+        let mut cx = rx;
+        for c in ALL {
+            let r = p.rect(cx + 3, ty + 23, 24, 24);
+            if is_hot(Act::AllColor(c)) {
+                p.circle(&p.rect(cx, ty + 20, 30, 30), BG, Some((SUB, 2)));
+            }
+            p.circle(&r, to_ref(c), None);
+            hit(r, Act::AllColor(c));
+            cx += 30;
+        }
+        chip(p, btn, cx + 10, ty + 20, 30, false, Act::AllToggle);
+    }
+    section(p, "PERFILES · CLIC DERECHO PARA EDITAR", x, ty);
+    let limit = if lit { rx - 24 } else { x + w };
+    let reserve = p.measure("+ Guardar", a.fonts.body).max(p.measure("Más ▾", a.fonts.body)) + 36;
+    let mut cx = x;
+    for (i, pr) in a.config.profiles.iter().enumerate() {
+        let tw = p.measure(&pr.name, a.fonts.body) + 28;
+        if cx + tw + reserve > limit {
+            chip(p, "Más ▾", cx, ty + 20, 30, false, Act::ProfileMore(i));
+            return;
+        }
+        cx += chip(p, &pr.name, cx, ty + 20, 30, pr.name == a.config.active_profile, Act::Profile(i)) + 8;
+    }
+    chip(p, "+ Guardar", cx, ty + 20, 30, false, Act::ProfileSave);
+}
+
 /// Fila de ajuste con interruptor, título y descripción.
 fn setting_row(p: &Painter, x: i32, y: i32, w: i32, title: &str, desc: &str, on: bool, act: Act) -> i32 {
     let a = app();
@@ -1086,14 +1265,24 @@ fn card(p: &Painter, x: i32, y: i32, w: i32, h: i32, title: &str) {
     p.fill(&p.rect(x, y + 22, w, h), CARD, 14);
 }
 
-/// Página de ajustes.
+/// Página de ajustes (se desplaza con la rueda si no cabe).
 fn paint_settings(p: &Painter, x: i32, w: i32) {
     let a = app();
     p.text("Ajustes", &p.rect(x, 22, w, 34), TEXT, a.fonts.title, DT_SINGLELINE);
     p.text(if portable_dir().is_some() { "Versión portable · la configuración se guarda junto al programa" } else { "Se guardan al momento" }, &p.rect(x, 58, w, 20), SUB, a.fonts.body, DT_SINGLELINE);
+    let view_top = 86;
+    let view_bottom = WIN_H - 8;
+    let view = p.rect(x - 8, view_top, w + 16, view_bottom - view_top);
+    unsafe {
+        SaveDC(p.dc);
+        IntersectClipRect(p.dc, view.left, view.top, view.right, view.bottom);
+    }
+    a.clip = Some(view);
+    let top = view_top + 10 - a.set_scroll;
     let half = (w - 20) / 2;
+
     // Columna izquierda
-    let mut y = 96;
+    let mut y = top;
     card(p, x, y, half, 176, "BARRA DE TAREAS");
     let yy = setting_row(p, x, y + 22, half, "Batería junto al reloj", "Un icono por dispositivo con su tipo y porcentaje.", !a.config.hide_tray_battery, Act::TrayBattery);
     setting_row(p, x, yy, half, "Batería en las otras pantallas", "Windows sólo los pone junto al reloj en la pantalla principal.", !a.config.hide_widget, Act::Widget);
@@ -1111,12 +1300,78 @@ fn paint_settings(p: &Painter, x: i32, w: i32) {
     }
     p.text("Aviso de Windows al bajar de ese nivel sin cargar.", &p.rect(x + 20, y + 80, half - 40, 20), SUB, a.fonts.small, DT_SINGLELINE | DT_END_ELLIPSIS);
     y += 136;
-    card(p, x, y, half, 50, "GENERAL");
-    setting_row(p, x, y + 22, half, "Iniciar con Windows", "", a.autostart, Act::Autostart);
+    card(p, x, y, half, 130, "INICIO");
+    let yy = setting_row(p, x, y + 22, half, "Iniciar con Windows", "", a.autostart || a.config.fast_start, Act::Autostart);
+    setting_row(p, x, yy, half, "Inicio rápido · prioridad alta", "Arranca nada más iniciar sesión, sin la espera que Windows pone a los programas de inicio.", a.config.fast_start, Act::FastStart);
+    y += 170;
+    let acts = state::hk_actions();
+    let hh = 44 + acts.len() as i32 * 52;
+    card(p, x, y, half, hh, "ATAJOS DE TECLADO · TAMBIÉN EN SEGUNDO PLANO");
+    let mut ry = y + 32;
+    for (i, (action, label)) in acts.iter().enumerate() {
+        let rec = a.recording.as_deref() == Some(action.as_str());
+        let hk = state::hotkey_of(action);
+        let (txt, col) = match hk {
+            _ if rec => ("Pulsa la combinación… (Esc cancela)".to_string(), AMBER),
+            Some(h) if a.hk_failed.contains(action) => (format!("{} · en uso por otro programa", state::combo_name(h.mods, h.vk)), RED),
+            Some(h) => (state::combo_name(h.mods, h.vk), ACCENT_HOT),
+            None => ("Sin atajo".to_string(), SUB),
+        };
+        // Botones a la derecha
+        let mut bx = x + half - 16;
+        if hk.is_some() && !rec {
+            bx -= p.measure("Quitar", a.fonts.body) + 28;
+            chip_bg(p, "Quitar", bx, ry + 6, 30, false, Act::HkClear(i), LINE);
+            bx -= 8;
+        }
+        let lbl = if rec { "Cancelar" } else if hk.is_some() { "Cambiar" } else { "Grabar" };
+        bx -= p.measure(lbl, a.fonts.body) + 28;
+        chip_bg(p, lbl, bx, ry + 6, 30, rec, Act::HkRecord(i), LINE);
+        p.text(label, &p.rect(x + 20, ry, bx - x - 28, 22), TEXT, a.fonts.bold, DT_SINGLELINE | DT_END_ELLIPSIS);
+        p.text(&txt, &p.rect(x + 20, ry + 22, bx - x - 28, 18), col, a.fonts.small, DT_SINGLELINE | DT_END_ELLIPSIS);
+        ry += 52;
+    }
+    p.text("Pulsa Grabar y luego la combinación, p. ej. Ctrl + Alt + L.", &p.rect(x + 20, ry, half - 40, 20), SUB, a.fonts.small, DT_SINGLELINE | DT_END_ELLIPSIS);
+    let left_end = y + 22 + hh;
 
     // Columna derecha
     let rx = x + half + 20;
-    let mut y = 96;
+    let mut y = top;
+    let devs: Vec<usize> = (0..a.devices.len()).filter(|&i| a.devices[i].led.is_some() && !is_keyboard(&a.devices[i])).collect();
+    let mut chips = Vec::new();
+    let (mut cx, mut cy) = (rx + 20, 0);
+    for &i in &devs {
+        let tw = (p.measure(&a.devices[i].name, a.fonts.small) + 24).min(half - 40);
+        if cx + tw > rx + half - 20 {
+            cx = rx + 20;
+            cy += 34;
+        }
+        chips.push((i, cx, cy, tw));
+        cx += tw + 6;
+    }
+    let chips_h = if devs.is_empty() { 22 } else { cy + 28 };
+    let ah = 262 + chips_h;
+    card(p, rx, y, half, ah, "APAGADO AUTOMÁTICO · VUELVEN SOLAS AL REGRESAR");
+    let mut yy = y + 22;
+    for (n, title) in ["Al bloquear el equipo (Win + L)", "Al apagarse la pantalla", "Al suspender el equipo", "Al apagar el equipo o cerrar sesión"].iter().enumerate() {
+        yy = setting_row(p, rx, yy, half, title, "", a.config.auto[n], Act::AutoOpt(n as u8));
+    }
+    p.text("QUÉ SE APAGA · EL TECLADO NUNCA", &p.rect(rx + 20, yy + 6, half - 40, 18), SUB, a.fonts.small, DT_SINGLELINE);
+    let base = yy + 30;
+    if devs.is_empty() {
+        p.text("Conecta un dispositivo con luces.", &p.rect(rx + 20, base, half - 40, 22), SUB, a.fonts.small, DT_SINGLELINE);
+    }
+    for (i, cx, cy, tw) in chips {
+        let d = &a.devices[i];
+        let configured = a.config.led.contains_key(&d.key);
+        let on = configured && !a.config.auto_exclude.contains(&d.key);
+        let r = p.rect(cx, base + cy, tw, 28);
+        p.fill(&r, if on { ACCENT } else if is_hot(Act::AutoDev(i)) { CARD_HOT } else { LINE }, 14);
+        p.text(&d.name, &RECT { left: r.left + s(10), right: r.right - s(10), ..r }, if configured { TEXT } else { SUB }, a.fonts.small, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        hit(r, Act::AutoDev(i));
+    }
+    p.text("Sólo los que tienen sus luces guardadas en Centro LED.", &p.rect(rx + 20, base + chips_h + 6, half - 40, 20), SUB, a.fonts.small, DT_SINGLELINE | DT_END_ELLIPSIS);
+    y += ah + 40;
     let orgb = a.devices.iter().filter(|d| d.conn == "OpenRGB").count();
     card(p, rx, y, half, 176, "OPENRGB · PLACA BASE, RAM, GRÁFICA…");
     let (status, col) = if orgb > 0 { (format!("● Conectado · {} dispositivo{}", orgb, if orgb == 1 { "" } else { "s" }), GREEN) } else { ("● No detectado".to_string(), SUB) };
@@ -1129,17 +1384,27 @@ fn paint_settings(p: &Painter, x: i32, w: i32) {
         DT_WORDBREAK,
     );
     y += 216;
+    card(p, rx, y, half, 118, "DIAGNÓSTICO");
+    p.text("Informe de tus dispositivos para investigar un problema. Se guarda donde elijas y no se envía a ningún sitio.", &p.rect(rx + 20, y + 34, half - 40, 40), SUB, a.fonts.small, DT_WORDBREAK);
+    let label = "Exportar diagnóstico…";
+    let tw = p.measure(label, a.fonts.body) + 32;
+    let b = p.rect(rx + 20, y + 80, tw, 34);
+    p.fill(&b, if is_hot(Act::Diagnostics) { CARD_HOT } else { LINE }, 10);
+    p.text(label, &b, TEXT, a.fonts.body, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    hit(b, Act::Diagnostics);
+    y += 158;
     card(p, rx, y, half, 128, "ACERCA DE");
     p.text(&format!("Centro LED {}", update::VERSION), &p.rect(rx + 20, y + 36, half - 40, 22), TEXT, a.fonts.bold, DT_SINGLELINE);
     let state = match &a.upd {
         Upd::Available(r) => format!("Hay una versión nueva: {}", r.version),
         Upd::Checking => "Comprobando actualizaciones…".into(),
-        Upd::UpToDate => "Estás al día".into(),
-        Upd::Installing => "Descargando la actualización…".into(),
+        Upd::UpToDate => "Estás al día · las versiones nuevas llegan firmadas".into(),
+        Upd::Installing => "Descargando y comprobando la firma…".into(),
+        Upd::Error(e) if e.contains("firma") || e.contains("alterado") || e.contains("firmada") => e.clone(),
         Upd::Error(_) => "No se pudo comprobar (sin conexión)".into(),
-        Upd::Idle => "Se actualiza sola desde GitHub".into(),
+        Upd::Idle => "Se actualiza sola desde GitHub (con firma comprobada)".into(),
     };
-    p.text(&state, &p.rect(rx + 20, y + 58, half - 40, 20), SUB, a.fonts.small, DT_SINGLELINE);
+    p.text(&state, &p.rect(rx + 20, y + 58, half - 40, 20), SUB, a.fonts.small, DT_SINGLELINE | DT_END_ELLIPSIS);
     let label = if matches!(a.upd, Upd::Available(_)) { "Actualizar ahora" } else { "Buscar actualizaciones" };
     let tw = p.measure(label, a.fonts.body) + 32;
     let b = p.rect(rx + 20, y + 90, tw, 34);
@@ -1150,6 +1415,19 @@ fn paint_settings(p: &Painter, x: i32, w: i32) {
     p.fill(&g, if is_hot(Act::OpenUrl) { CARD_HOT } else { LINE }, 10);
     p.text("Ver en GitHub", &g, TEXT, a.fonts.body, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     hit(g, Act::OpenUrl);
+    let right_end = y + 22 + 128;
+
+    unsafe {
+        RestoreDC(p.dc, -1);
+    }
+    a.clip = None;
+    a.set_max = (left_end.max(right_end) + a.set_scroll + 16 - view_bottom).max(0);
+    if a.set_scroll > 0 {
+        p.fill(&p.rect(x, view_top, w, 2), LINE, 1);
+    }
+    if a.set_scroll < a.set_max {
+        p.fill(&p.rect(x, view_bottom - 2, w, 2), LINE, 1);
+    }
 }
 
 /// Versión y estado de las actualizaciones, bajo el título.
@@ -1240,8 +1518,22 @@ fn section(p: &Painter, title: &str, x: i32, y: i32) {
 
 fn paint_device(p: &Painter, d: &Device, x: i32, w: i32) {
     let a = app();
-    // Cabecera
-    p.text(&d.name, &p.rect(x, 22, w - 200, 34), TEXT, a.fonts.title, DT_SINGLELINE | DT_END_ELLIPSIS);
+    // Cabecera: nombre y, a la derecha, historial de batería y perfiles del dispositivo
+    let mut bx = x + w;
+    if d.led.is_some() && (d.battery.is_some() || last_battery(d).is_some()) {
+        let label = if a.show_hist { "‹ Luces" } else { "Historial de batería" };
+        bx -= p.measure(label, a.fonts.body) + 28;
+        chip(p, label, bx, 26, 32, false, Act::HistToggle);
+        bx -= 8;
+    }
+    if d.led.is_some() && !a.show_hist {
+        let n = a.config.dprofiles.get(&d.key).map(|l| l.len()).unwrap_or(0);
+        let label = if n == 0 { "Perfiles ▾".to_string() } else { format!("Perfiles ({n}) ▾") };
+        bx -= p.measure(&label, a.fonts.body) + 28;
+        chip(p, &label, bx, 26, 32, false, Act::DevProfiles);
+        bx -= 8;
+    }
+    p.text(&d.name, &p.rect(x, 22, bx - x - 12, 34), TEXT, a.fonts.title, DT_SINGLELINE | DT_END_ELLIPSIS);
     let mut sub = format!("{} · {}", d.kind, d.conn);
     if d.battery.is_some() {
         sub += &format!(" · batería {}", battery_text(d));
@@ -1252,6 +1544,10 @@ fn paint_device(p: &Painter, d: &Device, x: i32, w: i32) {
         paint_battery_only(p, d, x, w);
         return;
     };
+    if a.show_hist {
+        paint_battery_only(p, d, x, w);
+        return;
+    }
     let keyboard = is_keyboard(d);
     let mut y = 96;
     // Pestañas: Teclas / Borde en el teclado, o una por zona de luz.
@@ -1786,32 +2082,56 @@ fn paint_device_hero(p: &Painter, d: &Device, x: i32, y: i32, w: i32) -> i32 {
 
 fn paint_battery_only(p: &Painter, d: &Device, x: i32, w: i32) {
     let a = app();
-    let card = p.rect(x, 110, w, 220);
+    let card = p.rect(x, 104, w, 176);
     p.fill(&card, CARD, 16);
-    p.text(glyph(d), &p.rect(x + 30, 140, 80, 80), TEXT, a.fonts.icon_big, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    p.text(glyph(d), &p.rect(x + 30, 122, 80, 80), TEXT, a.fonts.icon_big, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     match d.battery {
         Some(b) => {
             let txt = if b.approx { format!("≈ {} %", b.pct) } else { format!("{} %", b.pct) };
-            p.text(&txt, &p.rect(x + 140, 140, 300, 60), TEXT, a.fonts.title, DT_SINGLELINE | DT_VCENTER);
-            let state = if b.charging { "Cargando" } else if b.approx { "Nivel aproximado" } else { "Batería" };
-            p.text(state, &p.rect(x + 140, 196, 300, 22), SUB, a.fonts.body, DT_SINGLELINE);
+            p.text(&txt, &p.rect(x + 140, 122, 300, 56), TEXT, a.fonts.title, DT_SINGLELINE | DT_VCENTER);
+            let mut state = (if b.charging { "Cargando" } else if b.approx { "Nivel aproximado" } else { "Batería" }).to_string();
+            match history::estimate(d) {
+                Some((true, secs)) => state += &format!(" · se llenará en ≈ {}", history::fmt_dur(secs)),
+                Some((false, secs)) => state += &format!(" · quedan ≈ {} al ritmo de uso actual", history::fmt_dur(secs)),
+                None if !b.approx => state += " · la estimación aparece tras un rato de uso",
+                None => {}
+            }
+            p.text(&state, &p.rect(x + 140, 178, w - 170, 22), SUB, a.fonts.body, DT_SINGLELINE | DT_END_ELLIPSIS);
             let bw = w - 170;
-            p.fill(&p.rect(x + 140, 250, bw, 14), LINE, 7);
-            p.fill(&p.rect(x + 140, 250, (bw * b.pct as i32 / 100).max(14), 14), battery_color(b.pct), 7);
+            p.fill(&p.rect(x + 140, 226, bw, 14), LINE, 7);
+            p.fill(&p.rect(x + 140, 226, (bw * b.pct as i32 / 100).max(14), 14), battery_color(b.pct), 7);
         }
         None => {
-            p.text(&battery_text(d), &p.rect(x + 140, 150, w - 170, 40), TEXT, a.fonts.h2, DT_SINGLELINE | DT_VCENTER);
-            p.text("Este dispositivo no tiene luces configurables.", &p.rect(x + 140, 196, w - 170, 22), SUB, a.fonts.body, DT_SINGLELINE);
-            if d.kind == "Placa base" {
-                let hint = "Para controlar sus luces (y las de RAM, gráfica, ventiladores…), instala OpenRGB, \
-                            actívale el servidor SDK (pestaña SDK Server › Start Server) y déjalo abierto: \
-                            sus dispositivos aparecerán aquí en la lista.";
-                p.text(hint, &p.rect(x + 30, 350, w - 60, 80), SUB, a.fonts.body, DT_WORDBREAK);
+            p.text(&battery_text(d), &p.rect(x + 140, 134, w - 170, 40), TEXT, a.fonts.h2, DT_SINGLELINE | DT_VCENTER);
+            if d.led.is_none() {
+                p.text("Este dispositivo no tiene luces configurables.", &p.rect(x + 140, 180, w - 170, 22), SUB, a.fonts.body, DT_SINGLELINE);
             }
         }
     }
+    let has_hist = d.battery.is_some() || !history::get(&d.key).is_empty();
+    if has_hist {
+        section(p, "HISTORIAL DE BATERÍA", x, 300);
+        let mut cx = x + w;
+        for (label, days) in [("7 días", 7u8), ("24 h", 1)] {
+            let tw = p.measure(label, a.fonts.small) + 22;
+            cx -= tw;
+            let r = p.rect(cx, 294, tw, 26);
+            let on = a.hist_days == days as u64;
+            p.fill(&r, if on { ACCENT } else if is_hot(Act::HistRange(days)) { CARD_HOT } else { CARD }, 13);
+            p.text(label, &r, TEXT, a.fonts.small, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            hit(r, Act::HistRange(days));
+            cx -= 6;
+        }
+        p.fill(&p.rect(x, 326, w, WIN_H - 80 - 326), CARD, 16);
+        history::paint_graph(p, &d.key, x + 16, 372, w - 40, WIN_H - 80 - 372 - 44, a.hist_days);
+    } else if d.kind == "Placa base" {
+        let hint = "Para controlar sus luces (y las de RAM, gráfica, ventiladores…), instala OpenRGB, \
+                    actívale el servidor SDK (pestaña SDK Server › Start Server) y déjalo abierto: \
+                    sus dispositivos aparecerán aquí en la lista.";
+        p.text(hint, &p.rect(x + 30, 310, w - 60, 80), SUB, a.fonts.body, DT_WORDBREAK);
+    }
     if !a.status.is_empty() {
-        p.text(&a.status, &p.rect(x, WIN_H - 64, w, 40), SUB, a.fonts.small, DT_SINGLELINE | DT_VCENTER);
+        p.text(&a.status, &p.rect(x, WIN_H - 64, w, 40), SUB, a.fonts.small, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
     }
 }
 
@@ -1943,10 +2263,87 @@ fn on_click(act: Act, x: i32) {
         Act::Apply => on_apply(),
         Act::Scan => start_scan(),
         Act::Autostart => {
-            a.autostart = !a.autostart;
-            set_autostart(a.autostart);
+            if a.autostart || a.config.fast_start {
+                set_autostart(false);
+                if a.config.fast_start {
+                    let _ = state::fast_start_set(false);
+                    a.config.fast_start = false;
+                    save_config(&a.config);
+                }
+                a.autostart = false;
+            } else {
+                set_autostart(true);
+                a.autostart = true;
+            }
             redraw();
         }
+        Act::FastStart => {
+            if a.config.fast_start {
+                let _ = state::fast_start_set(false);
+                a.config.fast_start = false;
+                set_autostart(true);
+                a.autostart = true;
+                set_status("Inicio rápido desactivado: sigue iniciando con Windows de la forma normal");
+            } else {
+                match state::fast_start_set(true) {
+                    Ok(()) => {
+                        a.config.fast_start = true;
+                        set_autostart(false);
+                        a.autostart = false;
+                        set_status("✓ Centro LED arrancará nada más iniciar sesión");
+                    }
+                    Err(e) => set_status(&e),
+                }
+            }
+            save_config(&a.config);
+            redraw();
+        }
+        Act::Profile(i) => state::apply_profile(i),
+        Act::ProfileSave => state::save_new_profile(),
+        Act::ProfileMore(i) => state::more_profiles_menu(i),
+        Act::AllColor(c) => state::all_color(c),
+        Act::AllToggle => state::toggle_all(),
+        Act::DevProfiles => {
+            if let Some(d) = selected() {
+                state::device_profiles_menu(&d);
+            }
+        }
+        Act::HistToggle => {
+            a.show_hist = !a.show_hist;
+            redraw();
+        }
+        Act::HistRange(n) => {
+            a.hist_days = n as u64;
+            redraw();
+        }
+        Act::AutoOpt(n) => {
+            a.config.auto[n as usize] ^= true;
+            save_config(&a.config);
+            redraw();
+        }
+        Act::AutoDev(i) => {
+            if let Some(d) = a.devices.get(i) {
+                if !a.config.led.contains_key(&d.key) {
+                    set_status(&format!("Guarda antes las luces de {} en su página para que pueda apagarse solo", d.name));
+                } else if !a.config.auto_exclude.remove(&d.key) {
+                    a.config.auto_exclude.insert(d.key.clone());
+                }
+                save_config(&a.config);
+                redraw();
+            }
+        }
+        Act::HkRecord(i) => {
+            if let Some((action, _)) = state::hk_actions().get(i) {
+                state::toggle_recording(action);
+            }
+            unsafe { SetFocus(a.hwnd) };
+        }
+        Act::HkClear(i) => {
+            if let Some((action, _)) = state::hk_actions().get(i) {
+                state::clear_hotkey(action);
+            }
+        }
+        Act::Diagnostics => diag::export(),
         Act::Update => {
             if matches!(a.upd, Upd::Available(_)) {
                 start_update_install();
@@ -1968,33 +2365,31 @@ fn on_click(act: Act, x: i32) {
 fn on_scanned(list: Vec<Device>) {
     let a = app();
     a.scanning = false;
-    // Reaplicar luces que se pierden al reconectar (mandos, cascos) a los dispositivos nuevos.
+    // Volver a aplicar: las luces que se pierden al reconectar (mandos, cascos), las que se
+    // cambiaron mientras el dispositivo no estaba, los ciclos que se cortaron y, tras apagar el
+    // equipo con el apagado automático, las de antes. Con las luces apagadas solas, se apagan.
+    let restore = std::mem::take(&mut a.config.pending_restore);
     for d in &list {
-        if d.led.as_ref().map(|l| l.volatile).unwrap_or(false) && !a.known.contains(&d.key) {
-            if let Some(st) = a.config.led.get(&d.key) {
-                let pad = a.config.pads.get(&d.key).copied();
-                if is_app_animated(st.mode) {
-                    let list = a.config.cycles.get(&d.key).cloned().unwrap_or_default();
-                    start_cycle(d.clone(), list, *st, pad);
-                } else {
-                    start_apply(d.clone(), *st, saved_extra(d), true);
-                }
-            }
+        let Some(caps) = d.led.as_ref() else { continue };
+        if !a.config.led.contains_key(&d.key) {
+            continue;
+        }
+        let new = !a.known.contains(&d.key);
+        let pending = a.pending.remove(&d.key);
+        let st = state::reconnect_state(d);
+        let dead_cycle = !new && st.led.map(|l| is_app_animated(l.mode)).unwrap_or(false) && !cycle_running(&d.key);
+        if (caps.volatile && new) || pending || dead_cycle || (restore && new && state::auto_included(d)) {
+            state::send(d, &st, true);
         }
     }
-    // Si un ciclo se cortó (p. ej. el mando se reconectó rápido), volver a arrancarlo.
-    for d in &list {
-        if let Some(st) = a.config.led.get(&d.key) {
-            if is_app_animated(st.mode) && a.known.contains(&d.key) && !cycle_running(&d.key) {
-                let list = a.config.cycles.get(&d.key).cloned().unwrap_or_default();
-                start_cycle(d.clone(), list, *st, a.config.pads.get(&d.key).copied());
-            }
-        }
+    if restore {
+        save_config(&a.config);
     }
     a.known = list.iter().map(|d| d.key.clone()).collect();
     for d in &list {
         if let Some(b) = d.battery {
             a.last_battery.insert(d.key.clone(), b.pct);
+            history::record(&d.key, b.pct, b.charging);
             let limit = a.config.low_battery;
             if b.charging || b.pct >= limit.saturating_add(10) {
                 a.low_warned.remove(&d.key);
@@ -2004,6 +2399,11 @@ fn on_scanned(list: Vec<Device>) {
         }
     }
     a.devices = list;
+    state::seed_profiles();
+    if std::mem::take(&mut a.first_scan) {
+        // El inicio rápido arranca con prioridad alta; una vez listo, volver a la normal.
+        unsafe { SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS) };
+    }
     let still = a.sel.as_ref().map(|k| a.devices.iter().any(|d| &d.key == k)).unwrap_or(false);
     if !still {
         a.sel = None;
@@ -2624,7 +3024,7 @@ unsafe fn make_icon(size: i32) -> HICON {
     icon
 }
 
-fn update_tray(add_icon: bool) {
+fn update_tray(add_icon: bool) -> bool {
     let a = app();
     unsafe {
         let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
@@ -2641,7 +3041,7 @@ fn update_tray(add_icon: bool) {
         }
         let w: Vec<u16> = tip.encode_utf16().take(nid.szTip.len() - 1).collect();
         nid.szTip[..w.len()].copy_from_slice(&w);
-        Shell_NotifyIconW(if add_icon { NIM_ADD } else { NIM_MODIFY }, &nid);
+        Shell_NotifyIconW(if add_icon { NIM_ADD } else { NIM_MODIFY }, &nid) != 0
     }
 }
 
@@ -2696,8 +3096,20 @@ fn hide_to_tray() {
 fn tray_menu() {
     let h = app().hwnd;
     unsafe {
+        let a = app();
         let menu = CreatePopupMenu();
         AppendMenuW(menu, MF_STRING, MENU_OPEN, wide("Abrir Centro LED").as_ptr());
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        if !a.config.profiles.is_empty() {
+            let sub = CreatePopupMenu();
+            for (i, p) in a.config.profiles.iter().enumerate() {
+                let checked = if p.name == a.config.active_profile { MF_CHECKED } else { 0 };
+                AppendMenuW(sub, MF_STRING | checked, 200 + i, wide(&p.name).as_ptr());
+            }
+            AppendMenuW(menu, MF_STRING | MF_POPUP, sub as usize, wide("Perfiles").as_ptr());
+        }
+        let toggle = if state::all_lights_off() { "Encender todas las luces" } else { "Apagar todas las luces" };
+        AppendMenuW(menu, MF_STRING, MENU_TOGGLE, wide(toggle).as_ptr());
         AppendMenuW(menu, MF_STRING, MENU_SCAN, wide("Buscar dispositivos").as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
         AppendMenuW(menu, MF_STRING, MENU_EXIT, wide("Salir").as_ptr());
@@ -2709,6 +3121,8 @@ fn tray_menu() {
         match cmd {
             MENU_OPEN => show_main(),
             MENU_SCAN => start_scan(),
+            MENU_TOGGLE => state::toggle_all(),
+            200..=299 => state::apply_profile(cmd - 200),
             MENU_EXIT => {
                 DestroyWindow(h);
             }
@@ -2793,6 +3207,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 a.list_scroll = (a.list_scroll + step).clamp(0, a.list_max);
             } else if a.page == 0 {
                 a.home_scroll = (a.home_scroll + step).clamp(0, a.home_max);
+            } else if a.page == 2 {
+                a.set_scroll = (a.set_scroll + step).clamp(0, a.set_max);
             }
             redraw();
             0
@@ -2805,13 +3221,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_RBUTTONDOWN => {
-            // Cuentagotas: copiar el color de una tecla
+            // Cuentagotas: copiar el color de una tecla. En un perfil: su menú.
             let (x, y) = point(lp);
-            if let Some(Act::Key(i)) = hit_test(x, y) {
-                let c = a.keys[i];
-                a.cur.rgb = (c[0], c[1], c[2]);
-                a.cur.multi = false;
-                redraw();
+            match hit_test(x, y) {
+                Some(Act::Key(i)) => {
+                    let c = a.keys[i];
+                    a.cur.rgb = (c[0], c[1], c[2]);
+                    a.cur.multi = false;
+                    redraw();
+                }
+                Some(Act::Profile(i)) => state::profile_menu(i),
+                _ => {}
             }
             0
         }
@@ -2874,6 +3294,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 update_widgets();
                 return 0;
             }
+            if wp == TIMER_RESUME {
+                KillTimer(hwnd, TIMER_RESUME);
+                state::auto_set(state::AUTO_SLEEP, false, false);
+                return 0;
+            }
+            if wp == TIMER_TRAY {
+                if update_tray(true) {
+                    KillTimer(hwnd, TIMER_TRAY);
+                    update_battery_icons();
+                }
+                return 0;
+            }
             if wp == TIMER_UPDATE {
                 // Primera comprobación a los pocos segundos y luego cada 6 horas.
                 SetTimer(hwnd, TIMER_UPDATE, 6 * 3600 * 1000, None);
@@ -2909,6 +3341,65 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             DestroyWindow(hwnd);
             0
         }
+        0x02E0 => {
+            // WM_DPICHANGED: la ventana pasó a una pantalla con otra escala.
+            let dpi = (wp & 0xFFFF) as u32;
+            set_scale(dpi);
+            let r = &*(lp as *const RECT);
+            let mut rc = RECT { left: 0, top: 0, right: s(WIN_W), bottom: s(WIN_H) };
+            AdjustWindowRectExForDpi(&mut rc, WIN_STYLE, 0, 0, dpi);
+            SetWindowPos(hwnd, null_mut(), r.left, r.top, rc.right - rc.left, rc.bottom - rc.top, SWP_NOZORDER | SWP_NOACTIVATE);
+            InvalidateRect(hwnd, null(), 0);
+            0
+        }
+        WM_HOTKEY => {
+            state::on_hotkey(wp as i32);
+            0
+        }
+        WM_KEYDOWN | WM_SYSKEYDOWN if a.recording.is_some() => {
+            state::record_key(wp as u32);
+            redraw();
+            0
+        }
+        0x02B1 => {
+            // WM_WTSSESSION_CHANGE: 7 = equipo bloqueado, 8 = desbloqueado
+            match wp {
+                7 if a.config.auto[0] => state::auto_set(state::AUTO_LOCK, true, false),
+                8 => state::auto_set(state::AUTO_LOCK, false, false),
+                _ => {}
+            }
+            0
+        }
+        WM_POWERBROADCAST => {
+            match wp as u32 {
+                0x8013 => {
+                    // Pantalla: 0 apagada, 1 encendida, 2 atenuada
+                    let ps = &*(lp as *const POWERBROADCAST_SETTING);
+                    if ps.PowerSetting.data1 == GUID_CONSOLE_DISPLAY_STATE.data1 {
+                        match ps.Data[0] {
+                            0 if a.config.auto[1] => state::auto_set(state::AUTO_DISPLAY, true, false),
+                            1 => state::auto_set(state::AUTO_DISPLAY, false, false),
+                            _ => {}
+                        }
+                    }
+                }
+                4 if a.config.auto[2] => state::auto_set(state::AUTO_SLEEP, true, true), // a punto de suspender
+                0x12 | 7 if a.auto_off & state::AUTO_SLEEP != 0 => {
+                    SetTimer(hwnd, TIMER_RESUME, 4000, None);
+                }
+                _ => {}
+            }
+            1
+        }
+        WM_QUERYENDSESSION => 1,
+        WM_ENDSESSION => {
+            if wp != 0 && a.config.auto[3] {
+                state::auto_lights_off(true);
+                a.config.pending_restore = true;
+                save_config(&a.config);
+            }
+            0
+        }
         WM_UPD_INFO => {
             let r = *Box::from_raw(lp as *mut Result<Option<update::Release>, String>);
             a.upd = match r {
@@ -2940,7 +3431,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if wp == 0 {
                 a.applying = false;
             }
-            set_status(&text);
+            if !text.is_empty() {
+                set_status(&text);
+            }
             0
         }
         WM_TRAY => {
@@ -3024,6 +3517,24 @@ fn cli(args: &[String]) -> bool {
                 Err(e) => format!("error {e}"),
             };
             out_file(args.get(2).map(|s| s.as_str()).unwrap_or("update.txt"), text);
+            true
+        }
+        // CentroLED --verify <archivo> <nombre> <SHA256SUMS.txt> <firma> salida.txt  (comprueba una firma)
+        Some("--verify") if args.len() >= 7 => {
+            let rd = |p: &str| std::fs::read(p).unwrap_or_default();
+            let r = update::verify(&rd(&args[2]), &args[3], &rd(&args[4]), &rd(&args[5]));
+            out_file(&args[6], r.map(|_| "OK".to_string()).unwrap_or_else(|e| e));
+            true
+        }
+        // CentroLED --test-dialog salida.bmp salida.txt  (prueba del cuadro de nombre)
+        Some("--test-dialog") if args.len() >= 4 => {
+            unsafe { state::test_dialog(&args[2], &args[3]) };
+            true
+        }
+        // CentroLED --fast-start on|off salida.txt  (inicio rápido con una tarea programada)
+        Some("--fast-start") if args.len() >= 4 => {
+            let r = state::fast_start_set(args[2] == "on");
+            out_file(&args[3], r.map(|_| "OK".to_string()).unwrap_or_else(|e| e));
             true
         }
         // CentroLED --probe salida.txt
@@ -3120,9 +3631,14 @@ unsafe fn do_render(args: &[String]) {
     }
     let key = args.get(2).cloned().unwrap_or_default();
     a.devices = devices::scan();
+    state::seed_profiles_mem(); // sólo en memoria: las capturas no tocan la configuración
+    if let Some(h) = args.iter().position(|x| x == "--hist").and_then(|i| args.get(i + 1)) {
+        history::demo(h); // historial inventado para revisar la gráfica
+    }
     // "inicio" y "ajustes" dibujan esas páginas
     if key == "inicio" || key == "ajustes" {
         a.page = if key == "inicio" { 0 } else { 2 };
+        a.set_scroll = args.get(3).and_then(|t| t.parse().ok()).unwrap_or(0);
         let out = args.get(4).cloned().unwrap_or_else(|| "render.bmp".into());
         render_to_file(s(WIN_W), s(WIN_H), &out, |dc| paint(&Painter { dc }));
         return;
@@ -3151,6 +3667,7 @@ unsafe fn uninstall() {
         std::thread::sleep(std::time::Duration::from_millis(1500));
     }
     set_autostart(false);
+    let _ = state::fast_start_set(false);
     RegDeleteTreeW(HKEY_CURRENT_USER, wide(UNINSTALL_KEY).as_ptr());
     let appdata = std::env::var_os("APPDATA").map(std::path::PathBuf::from).unwrap_or_default();
     let _ = std::fs::remove_file(appdata.join("Microsoft\\Windows\\Start Menu\\Programs\\Centro LED.lnk"));
@@ -3192,6 +3709,36 @@ unsafe fn font(face: &str, px: i32, weight: i32, scale: f32) -> HFONT {
     CreateFontIndirectW(&lf)
 }
 
+unsafe fn make_fonts(scale: f32) -> Fonts {
+    let ui = "Segoe UI Variable Text";
+    Fonts {
+        title: font("Segoe UI Variable Display", 28, 600, scale),
+        h2: font("Segoe UI Variable Display", 18, 600, scale),
+        body: font(ui, 14, 400, scale),
+        bold: font(ui, 14, 600, scale),
+        small: font(ui, 12, 400, scale),
+        key: font(ui, 11, 600, scale),
+        key_small: font(ui, 8, 600, scale),
+        icon: font("Segoe Fluent Icons", 20, 400, scale),
+        icon_big: font("Segoe Fluent Icons", 56, 400, scale),
+        small_icon: font("Segoe Fluent Icons", 15, 400, scale),
+    }
+}
+
+/// Cambia la escala de la interfaz (al pasar la ventana a otra pantalla) y rehace las fuentes.
+fn set_scale(dpi: u32) {
+    let a = app();
+    let scale = dpi.max(96) as f32 / 96.0;
+    if (scale - a.scale).abs() < 0.01 {
+        return;
+    }
+    let old = std::mem::replace(&mut a.fonts, unsafe { make_fonts(scale) });
+    a.scale = scale;
+    for f in [old.title, old.h2, old.body, old.bold, old.small, old.key, old.key_small, old.icon, old.icon_big, old.small_icon] {
+        unsafe { DeleteObject(f) };
+    }
+}
+
 fn main() {
     // Si algo falla, dejar constancia en %APPDATA%\CentroLED\error.txt
     std::panic::set_hook(Box::new(|info| {
@@ -3231,21 +3778,10 @@ fn main() {
             return;
         }
         }
-        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE);
+        // Cada pantalla con su escala: la ventana se ve nítida también en la secundaria.
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let scale = GetDpiForSystem() as f32 / 96.0;
-        let ui = "Segoe UI Variable Text";
-        let fonts = Fonts {
-            title: font("Segoe UI Variable Display", 28, 600, scale),
-            h2: font("Segoe UI Variable Display", 18, 600, scale),
-            body: font(ui, 14, 400, scale),
-            bold: font(ui, 14, 600, scale),
-            small: font(ui, 12, 400, scale),
-            key: font(ui, 11, 600, scale),
-            key_small: font(ui, 8, 600, scale),
-            icon: font("Segoe Fluent Icons", 20, 400, scale),
-            icon_big: font("Segoe Fluent Icons", 56, 400, scale),
-            small_icon: font("Segoe Fluent Icons", 15, 400, scale),
-        };
+        let fonts = make_fonts(scale);
 
         let hinst = GetModuleHandleW(null());
         let icon = make_icon(64);
@@ -3322,12 +3858,24 @@ fn main() {
             home_max: 0,
             widgets: Vec::new(),
             widget_drag: None,
+            auto_off: 0,
+            pending: HashSet::new(),
+            recording: None,
+            hk_ids: Vec::new(),
+            hk_failed: HashSet::new(),
+            set_scroll: 0,
+            set_max: 0,
+            clip: None,
+            hist: HashMap::new(),
+            hist_days: 1,
+            show_hist: false,
+            first_scan: true,
         });
         APP = Box::into_raw(app_box);
 
-        let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+        let style = WIN_STYLE;
         let mut rc = RECT { left: 0, top: 0, right: s(WIN_W), bottom: s(WIN_H) };
-        AdjustWindowRectEx(&mut rc, style, 0, 0);
+        AdjustWindowRectExForDpi(&mut rc, style, 0, 0, GetDpiForSystem());
         let hwnd = CreateWindowExW(
             0,
             class.as_ptr(),
@@ -3347,6 +3895,14 @@ fn main() {
             do_render(&args);
             return;
         }
+        // Si la ventana nace en una pantalla con otra escala, ajustarla ya.
+        let dpi = GetDpiForWindow(hwnd);
+        if dpi != GetDpiForSystem() {
+            set_scale(dpi);
+            let mut rc = RECT { left: 0, top: 0, right: s(WIN_W), bottom: s(WIN_H) };
+            AdjustWindowRectExForDpi(&mut rc, WIN_STYLE, 0, 0, dpi);
+            SetWindowPos(hwnd, null_mut(), 0, 0, rc.right - rc.left, rc.bottom - rc.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
         // Versión instalada: mantener al día la versión que muestra "Aplicaciones instaladas".
         let mut ukey: HKEY = null_mut();
         if RegOpenKeyExW(HKEY_CURRENT_USER, wide(UNINSTALL_KEY).as_ptr(), 0, KEY_SET_VALUE, &mut ukey) == 0 {
@@ -3355,7 +3911,13 @@ fn main() {
             RegCloseKey(ukey);
         }
         // Si el inicio automático apunta a otra copia del programa (se movió el .exe), corregirlo.
-        if let (Some(v), Ok(exe)) = (autostart_value(), std::env::current_exe()) {
+        if app().config.fast_start {
+            if autostart_value().is_some() {
+                set_autostart(false);
+                app().autostart = false;
+            }
+            state::fast_start_check();
+        } else if let (Some(v), Ok(exe)) = (autostart_value(), std::env::current_exe()) {
             if !v.to_lowercase().contains(&exe.display().to_string().to_lowercase()) {
                 set_autostart(true);
             }
@@ -3363,7 +3925,14 @@ fn main() {
         // Barra de título oscura (Windows 11)
         let dark: i32 = 1;
         DwmSetWindowAttribute(hwnd, 20, &dark as *const i32 as _, 4);
-        update_tray(true);
+        if !update_tray(true) {
+            // Con el inicio rápido la barra de tareas puede no existir todavía.
+            SetTimer(hwnd, TIMER_TRAY, 2000, None);
+        }
+        // Bloqueo / desbloqueo, pantalla encendida / apagada y atajos de teclado.
+        WTSRegisterSessionNotification(hwnd, 0);
+        RegisterPowerSettingNotification(hwnd as HANDLE, &GUID_CONSOLE_DISPLAY_STATE, 0);
+        state::register_hotkeys();
         if start_hidden {
             hide_to_tray();
         } else {

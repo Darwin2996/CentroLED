@@ -1,6 +1,6 @@
 # Centro LED
 
-App nativa de Windows (Rust + Win32, ~310 KB) para controlar las luces y ver la batería de tus periféricos. En segundo plano usa unos pocos MB de RAM y prácticamente 0 % de CPU.
+App nativa de Windows (Rust + Win32, ~720 KB) para controlar las luces y ver la batería de tus periféricos. En segundo plano usa unos pocos MB de RAM y prácticamente 0 % de CPU.
 
 ## Dispositivos
 
@@ -33,7 +33,14 @@ Las luces de mandos y cascos se pierden al desconectarlos; la app las vuelve a a
 - **Batería en todas las pantallas**: Windows sólo pone iconos junto al reloj en la pantalla principal, así que en las demás Centro LED coloca un pequeño widget sobre la barra de tareas, junto a su reloj. Clic = abrir Centro LED, clic derecho = menú, arrastrar = moverlo. Se oculta solo con juegos o vídeos a pantalla completa en esa pantalla.
 - **Batería en la barra de tareas**: cada dispositivo con batería tiene su icono junto al reloj: el dibujo del tipo de dispositivo (mando, cascos, ratón, teclado…) sobre una pila con el porcentaje (verde/ámbar/rojo, contorno amarillo al cargar, gris si es el último valor conocido). Se adapta al tema claro u oscuro de la barra. Se activa o desactiva en la barra lateral. Windows 11 coloca los iconos nuevos tras la flecha **^**: la app los marca para mostrarse y Windows lo aplica al reiniciar la sesión; o arrástralos una vez de la flecha a la barra.
 - **Aviso de batería baja**: notificación de Windows al bajar del 15 % sin cargar (requiere tener las notificaciones de Windows activadas).
-- "Iniciar con Windows" la arranca minimizada en la bandeja (si mueves el `.exe`, la entrada se corrige sola al abrirlo).
+- **Perfiles**: en *Inicio* hay botones con tus perfiles (de ejemplo: *Juego*, *Noche* con poco brillo y *Apagado*, que no toca el teclado). Clic = aplicar, clic derecho = guardar ahí las luces actuales, cambiar nombre o borrar; **+ Guardar** crea uno nuevo con las luces de ahora. También desde el icono de la bandeja (*Perfiles*). Los dispositivos desconectados reciben el perfil al conectarse. Cada dispositivo tiene además sus propios perfiles en el botón **Perfiles ▾** de su página.
+- **Todas las luces**: en *Inicio*, un color para todos los dispositivos a la vez y **Apagar todo / Encender todo** (vuelven exactamente como estaban).
+- **Apagado automático** (*Ajustes*, todo desactivado de serie): apaga las luces al bloquear el equipo, al apagarse la pantalla, al suspender o al apagar el equipo, y las devuelve solas al volver, sin cambiar tu configuración. El teclado nunca se apaga solo; puedes elegir qué otros dispositivos participan.
+- **Atajos de teclado** (*Ajustes*): graba la combinación que quieras para apagar/encender todas las luces o para cada perfil. Funcionan con la app en segundo plano y con juegos abiertos. Si otro programa ya usa la combinación, se avisa en rojo.
+- **Historial de batería**: cada dispositivo con batería guarda 30 días de lecturas (`bateria\*.csv` junto a la configuración). En su página se ve la gráfica de 24 h o 7 días y el tiempo que le queda (o lo que tarda en cargarse) al ritmo de uso actual; la estimación sale también en las tarjetas de *Inicio*.
+- **Diagnóstico** (*Ajustes*): guarda un `.txt` con la versión de Windows, las pantallas, los dispositivos reconocidos y todas las colecciones HID, para investigar un dispositivo que no va. Se guarda donde elijas, no se envía a ningún sitio y no incluye números de serie ni tu nombre de usuario (los nombres de dispositivos Bluetooth son los que les hayas puesto: revísalo antes de compartirlo).
+- "Iniciar con Windows" la arranca minimizada en la bandeja (si mueves el `.exe`, la entrada se corrige sola al abrirlo). **Inicio rápido · prioridad alta** la arranca con una tarea programada nada más iniciar sesión, sin la espera que Windows pone a los programas de inicio y con prioridad alta mientras arranca (luego vuelve a la normal). No necesita permisos de administrador.
+- La ventana se adapta a la escala de cada pantalla (se ve nítida también en una secundaria con otra escala).
 - La batería se actualiza cada minuto y al conectar/desconectar dispositivos.
 - Configuración guardada en `%APPDATA%\CentroLED\config.txt`; si algo falla, el motivo queda en `%APPDATA%\CentroLED\error.txt`.
 
@@ -42,6 +49,8 @@ Línea de comandos (para scripts):
 ```
 CentroLED.exe --probe salida.txt
 CentroLED.exe --set <clave> <modo|off> <rrggbb> <brillo 0-100> <velocidad 0-100> salida.txt
+CentroLED.exe --fast-start on|off salida.txt
+CentroLED.exe --verify <archivo> <nombre> SHA256SUMS.txt SHA256SUMS.txt.sig salida.txt
 ```
 
 ## OpenRGB
@@ -70,7 +79,9 @@ En la [última release](https://github.com/Darwin2996/CentroLED/releases/latest)
 
 La app comprueba sola si hay una versión nueva (al arrancar y cada 6 horas). Si la hay, bajo el título aparece el botón **Actualizar a vX**: descarga la versión nueva, sustituye el ejecutable y se reinicia. También puedes pulsar la línea de versión para comprobarlo en el momento.
 
-Para publicar una versión nueva: sube `version` en `Cargo.toml`, compila y crea una release con la etiqueta `vX.Y.Z` adjuntando `CentroLED.exe`, `CentroLED-Portable.exe` (copia del anterior) y `CentroLED-Setup.exe`.
+**Actualizaciones firmadas** (desde la 1.5.0): cada release incluye `SHA256SUMS.txt` (la suma SHA-256 de cada archivo) y `SHA256SUMS.txt.sig` (su firma ECDSA P-256). La app y el instalador sólo instalan un ejecutable si la firma es válida con la clave pública que llevan dentro y la suma coincide; si falta algo o no cuadra, no instalan nada. La clave privada sólo está en el PC del autor (no en el repositorio), así que nadie más puede publicar una versión que se instale sola. Es una clave propia y gratuita, sin certificados de pago (por eso Windows SmartScreen puede seguir avisando la primera vez que abres el `.exe` descargado).
+
+Para publicar una versión nueva: sube `version` en `Cargo.toml`, compila, copia `CentroLED.exe` también como `CentroLED-Portable.exe`, firma la carpeta con `powershell -ExecutionPolicy Bypass -File toolsirmar-release.ps1 <carpeta>` y crea una release con la etiqueta `vX.Y.Z` adjuntando los tres `.exe`, `SHA256SUMS.txt` y `SHA256SUMS.txt.sig`.
 
 ## Compilar
 

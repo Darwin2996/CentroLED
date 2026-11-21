@@ -132,7 +132,7 @@ fn register_uninstall(exe: &Path, dir: &Path, version: &str, bytes: usize) {
 /// Descarga la última versión y la instala en `dir`. `register` crea accesos directos y desinstalador.
 fn install(dir: &Path, register: bool, desktop: bool) -> Result<PathBuf, String> {
     let rel = update::latest()?;
-    let data = update::download(&rel.url)?;
+    let data = update::fetch_verified(&rel)?;
     if data.len() < 50_000 || !data.starts_with(b"MZ") {
         return Err("El archivo descargado no es válido".into());
     }
