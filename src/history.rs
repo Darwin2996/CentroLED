@@ -130,8 +130,8 @@ pub fn paint_graph(p: &Painter, key: &str, x: i32, y: i32, w: i32, h: i32, days:
     // Rejilla 0 / 50 / 100 %
     for (pct, label) in [(100, "100 %"), (50, "50 %"), (0, "0 %")] {
         let ly = y + h - h * pct / 100;
-        p.fill(&p.rect(gx, ly, gw, 1), LINE, 0);
-        p.text(label, &p.rect(x, ly - 9, 40, 18), SUB, a.fonts.small, DT_SINGLELINE | DT_VCENTER | DT_RIGHT);
+        p.fill(&p.rect(gx, ly, gw, 1), th().line, 0);
+        p.text(label, &p.rect(x, ly - 9, 40, 18), th().sub, a.fonts.small, DT_SINGLELINE | DT_VCENTER | DT_RIGHT);
     }
     let labels: Vec<(f32, String)> = if days == 1 {
         vec![(0.0, "hace 24 h".into()), (0.5, "hace 12 h".into()), (1.0, "ahora".into())]
@@ -140,14 +140,14 @@ pub fn paint_graph(p: &Painter, key: &str, x: i32, y: i32, w: i32, h: i32, days:
     };
     for (f, label) in labels {
         let lx = gx + (gw as f32 * f) as i32;
-        p.text(&label, &p.rect(lx - 40, y + h + 6, 80, 18), SUB, a.fonts.small, DT_SINGLELINE | DT_CENTER);
+        p.text(&label, &p.rect(lx - 40, y + h + 6, 80, 18), th().sub, a.fonts.small, DT_SINGLELINE | DT_CENTER);
     }
     let pts: Vec<&Rec> = list.iter().filter(|r| r.t + GAP >= start).collect();
     if pts.is_empty() {
         p.text(
             "Todavía no hay datos: la batería se va apuntando mientras Centro LED está abierto (también en segundo plano).",
             &p.rect(gx + 20, y + h / 2 - 30, gw - 40, 60),
-            SUB,
+            th().sub,
             a.fonts.body,
             DT_CENTER | DT_WORDBREAK,
         );
@@ -156,8 +156,8 @@ pub fn paint_graph(p: &Painter, key: &str, x: i32, y: i32, w: i32, h: i32, days:
     let px = |t: u64| s(gx) + ((t.max(start) - start) as f64 / range as f64 * s(gw) as f64) as i32;
     let py = |pct: u8| s(y + h) - (s(h) as f64 * pct.min(100) as f64 / 100.0) as i32;
     unsafe {
-        let normal = CreatePen(PS_SOLID, s(2).max(1), ACCENT);
-        let charge = CreatePen(PS_SOLID, s(2).max(1), AMBER);
+        let normal = CreatePen(PS_SOLID, s(2).max(1), th().accent);
+        let charge = CreatePen(PS_SOLID, s(2).max(1), th().amber);
         let old = SelectObject(p.dc, normal);
         for wnd in pts.windows(2) {
             let (r0, r1) = (wnd[0], wnd[1]);
@@ -176,10 +176,10 @@ pub fn paint_graph(p: &Painter, key: &str, x: i32, y: i32, w: i32, h: i32, days:
         let (lx, ly) = (px(l.t), py(l.pct));
         let r = s(4);
         let dot = RECT { left: lx - r, top: ly - r, right: lx + r, bottom: ly + r };
-        p.circle(&dot, if l.charging { AMBER } else { ACCENT }, None);
+        p.circle(&dot, if l.charging { th().amber } else { th().accent }, None);
     }
-    p.text("━ usando   ", &p.rect(x + w - 190, y - 26, 100, 18), ACCENT, a.fonts.small, DT_SINGLELINE | DT_RIGHT);
-    p.text("━ cargando", &p.rect(x + w - 90, y - 26, 90, 18), AMBER, a.fonts.small, DT_SINGLELINE | DT_RIGHT);
+    p.text("━ usando   ", &p.rect(x + w - 190, y - 26, 100, 18), th().accent, a.fonts.small, DT_SINGLELINE | DT_RIGHT);
+    p.text("━ cargando", &p.rect(x + w - 90, y - 26, 90, 18), th().amber, a.fonts.small, DT_SINGLELINE | DT_RIGHT);
 }
 
 /// Historial de ejemplo en memoria para las capturas de prueba (`--render ... --hist <clave>`).

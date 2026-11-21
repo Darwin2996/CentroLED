@@ -1,6 +1,6 @@
 # Centro LED
 
-App nativa de Windows (Rust + Win32, ~720 KB) para controlar las luces y ver la batería de tus periféricos. En segundo plano usa unos pocos MB de RAM y prácticamente 0 % de CPU.
+App nativa de Windows (Rust + Win32, ~750 KB) para controlar las luces y ver la batería de tus periféricos. En segundo plano usa unos pocos MB de RAM y prácticamente 0 % de CPU.
 
 ## Dispositivos
 
@@ -40,6 +40,7 @@ Las luces de mandos y cascos se pierden al desconectarlos; la app las vuelve a a
 - **Historial de batería**: cada dispositivo con batería guarda 30 días de lecturas (`bateria\*.csv` junto a la configuración). En su página se ve la gráfica de 24 h o 7 días y el tiempo que le queda (o lo que tarda en cargarse) al ritmo de uso actual; la estimación sale también en las tarjetas de *Inicio*.
 - **Diagnóstico** (*Ajustes*): guarda un `.txt` con la versión de Windows, las pantallas, los dispositivos reconocidos y todas las colecciones HID, para investigar un dispositivo que no va. Se guarda donde elijas, no se envía a ningún sitio y no incluye números de serie ni tu nombre de usuario (los nombres de dispositivos Bluetooth son los que les hayas puesto: revísalo antes de compartirlo).
 - "Iniciar con Windows" la arranca minimizada en la bandeja (si mueves el `.exe`, la entrada se corrige sola al abrirlo). **Inicio rápido · prioridad alta** la arranca con una tarea programada nada más iniciar sesión, sin la espera que Windows pone a los programas de inicio y con prioridad alta mientras arranca (luego vuelve a la normal). No necesita permisos de administrador.
+- **Apariencia** (*Ajustes*): seis temas (*Oscuro*, *Negro* para pantallas OLED, *Grafito*, *Océano*, *Claro* y *Sistema*, que sigue el modo claro u oscuro de Windows), ocho colores de acento (incluido el de Windows) y esquinas redondeadas o rectas. La barra de título y los menús cambian con el tema. La vista previa del teclado se queda oscura con cualquier tema.
 - La ventana se adapta a la escala de cada pantalla (se ve nítida también en una secundaria con otra escala).
 - La batería se actualiza cada minuto y al conectar/desconectar dispositivos.
 - Configuración guardada en `%APPDATA%\CentroLED\config.txt`; si algo falla, el motivo queda en `%APPDATA%\CentroLED\error.txt`.
@@ -81,7 +82,7 @@ La app comprueba sola si hay una versión nueva (al arrancar y cada 6 horas). Si
 
 **Actualizaciones firmadas** (desde la 1.5.0): cada release incluye `SHA256SUMS.txt` (la suma SHA-256 de cada archivo) y `SHA256SUMS.txt.sig` (su firma ECDSA P-256). La app y el instalador sólo instalan un ejecutable si la firma es válida con la clave pública que llevan dentro y la suma coincide; si falta algo o no cuadra, no instalan nada. La clave privada sólo está en el PC del autor (no en el repositorio), así que nadie más puede publicar una versión que se instale sola. Es una clave propia y gratuita, sin certificados de pago (por eso Windows SmartScreen puede seguir avisando la primera vez que abres el `.exe` descargado).
 
-Para publicar una versión nueva: sube `version` en `Cargo.toml`, compila, copia `CentroLED.exe` también como `CentroLED-Portable.exe`, firma la carpeta con `powershell -ExecutionPolicy Bypass -File toolsirmar-release.ps1 <carpeta>` y crea una release con la etiqueta `vX.Y.Z` adjuntando los tres `.exe`, `SHA256SUMS.txt` y `SHA256SUMS.txt.sig`.
+Para publicar una versión nueva: sube `version` en `Cargo.toml`, compila, copia `CentroLED.exe` también como `CentroLED-Portable.exe`, firma la carpeta con `powershell -ExecutionPolicy Bypass -File tools\firmar-release.ps1 <carpeta>` y crea una release con la etiqueta `vX.Y.Z` adjuntando los tres `.exe`, `SHA256SUMS.txt` y `SHA256SUMS.txt.sig`.
 
 ## Compilar
 

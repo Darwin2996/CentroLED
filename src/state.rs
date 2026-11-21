@@ -987,7 +987,7 @@ unsafe extern "system" fn name_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
             SetDlgItemTextW(h, 100, lp as *const u16);
             SendDlgItemMessageW(h, 100, 0x00B1 /* EM_SETSEL */, 0, -1);
             SetFocus(GetDlgItem(h, 100));
-            let dark: i32 = 1;
+            let dark: i32 = (!th().light) as i32;
             DwmSetWindowAttribute(h, 20, &dark as *const i32 as _, 4);
             0
         }

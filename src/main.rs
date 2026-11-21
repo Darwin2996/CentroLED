@@ -76,19 +76,91 @@ const GUID_CONSOLE_DISPLAY_STATE: windows_sys::core::GUID = windows_sys::core::G
 const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     r as u32 | (g as u32) << 8 | (b as u32) << 16
 }
-const BG: u32 = rgb(0x12, 0x12, 0x18);
-const SIDEBAR: u32 = rgb(0x19, 0x19, 0x22);
-const CARD: u32 = rgb(0x22, 0x22, 0x2D);
-const CARD_HOT: u32 = rgb(0x2C, 0x2C, 0x3A);
-const LINE: u32 = rgb(0x34, 0x34, 0x44);
-const TEXT: u32 = rgb(0xF2, 0xF2, 0xF6);
-const SUB: u32 = rgb(0x9C, 0x9C, 0xB0);
-const ACCENT: u32 = rgb(0x8B, 0x5C, 0xF6);
-const ACCENT_HOT: u32 = rgb(0xA0, 0x7A, 0xFF);
+/// Colores de la interfaz: dependen del tema, el color de acento y las esquinas de Ajustes.
+#[derive(Clone, Copy)]
+struct Theme {
+    bg: u32,
+    sidebar: u32,
+    card: u32,
+    card_hot: u32,
+    line: u32,
+    /// Contorno fino de tarjetas y botones.
+    border: u32,
+    text: u32,
+    sub: u32,
+    accent: u32,
+    /// Acento para resaltar y para texto (más claro en los temas oscuros, más oscuro en el claro).
+    accent_hot: u32,
+    /// Texto sobre el acento (blanco, o casi negro si el acento es muy claro).
+    on_accent: u32,
+    green: u32,
+    amber: u32,
+    red: u32,
+    light: bool,
+    /// Esquinas rectas en vez de redondeadas.
+    square: bool,
+}
+
+/// Tema base (nombres en THEME_NAMES): fondo, barra lateral, tarjeta, tarjeta resaltada, línea, contorno, texto y texto secundario.
+struct Base {
+    c: [u32; 8],
+    light: bool,
+}
+
+const BASES: [Base; 5] = [
+    Base { c: [rgb(0x12, 0x12, 0x18), rgb(0x19, 0x19, 0x22), rgb(0x22, 0x22, 0x2D), rgb(0x2C, 0x2C, 0x3A), rgb(0x34, 0x34, 0x44), rgb(0x2B, 0x2B, 0x38), rgb(0xF2, 0xF2, 0xF6), rgb(0x9C, 0x9C, 0xB0)], light: false },
+    Base { c: [rgb(0x00, 0x00, 0x00), rgb(0x0B, 0x0B, 0x0E), rgb(0x16, 0x16, 0x1A), rgb(0x22, 0x22, 0x28), rgb(0x2E, 0x2E, 0x35), rgb(0x22, 0x22, 0x28), rgb(0xF2, 0xF2, 0xF6), rgb(0x96, 0x96, 0xA4)], light: false },
+    Base { c: [rgb(0x1E, 0x1E, 0x1E), rgb(0x27, 0x27, 0x27), rgb(0x2D, 0x2D, 0x2D), rgb(0x38, 0x38, 0x38), rgb(0x46, 0x46, 0x46), rgb(0x37, 0x37, 0x37), rgb(0xFF, 0xFF, 0xFF), rgb(0xAA, 0xAA, 0xAA)], light: false },
+    Base { c: [rgb(0x0B, 0x12, 0x20), rgb(0x10, 0x19, 0x2B), rgb(0x17, 0x22, 0x38), rgb(0x20, 0x2E, 0x4A), rgb(0x2A, 0x3A, 0x58), rgb(0x20, 0x2D, 0x46), rgb(0xEC, 0xF2, 0xFA), rgb(0x8F, 0xA2, 0xBF)], light: false },
+    Base { c: [rgb(0xF3, 0xF3, 0xF6), rgb(0xE9, 0xE9, 0xEF), rgb(0xFF, 0xFF, 0xFF), rgb(0xEE, 0xEE, 0xF3), rgb(0xDC, 0xDC, 0xE4), rgb(0xE0, 0xE0, 0xE8), rgb(0x1A, 0x1A, 0x22), rgb(0x62, 0x62, 0x74)], light: true },
+];
+
+/// Nombres de los temas en Ajustes (el último sigue el modo claro u oscuro de Windows).
+const THEME_NAMES: [&str; 6] = ["Oscuro", "Negro", "Grafito", "Océano", "Claro", "Sistema"];
+const THEME_SYSTEM: u8 = 5;
+
+/// Colores de acento (el último es el de Windows).
+const ACCENTS: [(&str, u32); 8] = [
+    ("Violeta", rgb(0x8B, 0x5C, 0xF6)),
+    ("Azul", rgb(0x3B, 0x82, 0xF6)),
+    ("Cian", rgb(0x08, 0x91, 0xB2)),
+    ("Verde", rgb(0x16, 0xA3, 0x4A)),
+    ("Rosa", rgb(0xDB, 0x27, 0x77)),
+    ("Naranja", rgb(0xEA, 0x58, 0x0C)),
+    ("Rojo", rgb(0xDC, 0x26, 0x26)),
+    ("Windows", 0),
+];
+const ACCENT_WINDOWS: u8 = 7;
+
+/// Teclas de la vista previa del teclado: el teclado es oscuro con cualquier tema.
 const KEYCAP: u32 = rgb(0x24, 0x24, 0x2E);
-const GREEN: u32 = rgb(0x3D, 0xDC, 0x84);
-const AMBER: u32 = rgb(0xF5, 0xA6, 0x23);
-const RED: u32 = rgb(0xFF, 0x5A, 0x5F);
+const KB_TEXT: u32 = rgb(0xF2, 0xF2, 0xF6);
+const KB_SUB: u32 = rgb(0x9C, 0x9C, 0xB0);
+const KB_LINE: u32 = rgb(0x34, 0x34, 0x44);
+
+static mut THEME: Theme = Theme {
+    bg: BASES[0].c[0],
+    sidebar: BASES[0].c[1],
+    card: BASES[0].c[2],
+    card_hot: BASES[0].c[3],
+    line: BASES[0].c[4],
+    border: BASES[0].c[5],
+    text: BASES[0].c[6],
+    sub: BASES[0].c[7],
+    accent: rgb(0x8B, 0x5C, 0xF6),
+    accent_hot: rgb(0xA0, 0x7A, 0xFF),
+    on_accent: rgb(0xFF, 0xFF, 0xFF),
+    green: rgb(0x3D, 0xDC, 0x84),
+    amber: rgb(0xF5, 0xA6, 0x23),
+    red: rgb(0xFF, 0x5A, 0x5F),
+    light: false,
+    square: false,
+};
+
+/// Colores actuales de la interfaz.
+fn th() -> &'static Theme {
+    unsafe { &*std::ptr::addr_of!(THEME) }
+}
 
 const PALETTE: [[u8; 3]; 12] = [
     [0xFF, 0x00, 0x00],
@@ -132,6 +204,102 @@ fn hue(h: f32) -> [u8; 3] {
         _ => (1.0, 0.0, x),
     };
     [(r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8]
+}
+
+/// Luminosidad aproximada (0 = negro, 1 = blanco).
+fn luma(c: u32) -> f32 {
+    ((c & 0xFF) as f32 * 0.299 + ((c >> 8) & 0xFF) as f32 * 0.587 + ((c >> 16) & 0xFF) as f32 * 0.114) / 255.0
+}
+
+/// Valor DWORD del registro del usuario.
+fn reg_dword(path: &str, name: &str) -> Option<u32> {
+    unsafe {
+        let mut key: HKEY = null_mut();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, wide(path).as_ptr(), 0, KEY_QUERY_VALUE, &mut key) != 0 {
+            return None;
+        }
+        let mut v: u32 = 0;
+        let mut size = 4u32;
+        let ok = RegQueryValueExW(key, wide(name).as_ptr(), null(), null_mut(), &mut v as *mut u32 as *mut u8, &mut size) == 0;
+        RegCloseKey(key);
+        ok.then_some(v)
+    }
+}
+
+/// ¿Las aplicaciones de Windows usan el modo claro?
+fn system_light() -> bool {
+    reg_dword("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", "AppsUseLightTheme") == Some(1)
+}
+
+/// Color de énfasis de Windows (Configuración › Personalización › Colores).
+fn windows_accent() -> u32 {
+    reg_dword("Software\\Microsoft\\Windows\\DWM", "AccentColor").map(|v| v & 0x00FF_FFFF).unwrap_or(ACCENTS[0].1)
+}
+
+fn make_theme(theme: u8, accent: u8, square: bool) -> Theme {
+    let b = match theme {
+        THEME_SYSTEM => &BASES[if system_light() { 4 } else { 0 }],
+        t => &BASES[(t as usize).min(BASES.len() - 1)],
+    };
+    let acc = if accent == ACCENT_WINDOWS { windows_accent() } else { ACCENTS[(accent as usize).min(ACCENTS.len() - 2)].1 };
+    let white = rgb(0xFF, 0xFF, 0xFF);
+    Theme {
+        bg: b.c[0],
+        sidebar: b.c[1],
+        card: b.c[2],
+        card_hot: b.c[3],
+        line: b.c[4],
+        border: b.c[5],
+        text: b.c[6],
+        sub: b.c[7],
+        accent: acc,
+        accent_hot: if b.light { mix(acc, 0, 0.18) } else { mix(acc, white, 0.2) },
+        on_accent: if luma(acc) > 0.62 { rgb(0x14, 0x14, 0x18) } else { white },
+        green: if b.light { rgb(0x16, 0x9A, 0x50) } else { rgb(0x3D, 0xDC, 0x84) },
+        amber: if b.light { rgb(0xB0, 0x68, 0x00) } else { rgb(0xF5, 0xA6, 0x23) },
+        red: if b.light { rgb(0xD0, 0x2C, 0x33) } else { rgb(0xFF, 0x5A, 0x5F) },
+        light: b.light,
+        square,
+    }
+}
+
+/// Aplica el tema guardado: colores, barra de título y menús.
+fn apply_theme() {
+    let a = app();
+    unsafe {
+        THEME = make_theme(a.config.theme, a.config.accent, a.config.square);
+        if !a.hwnd.is_null() {
+            style_window(a.hwnd);
+        }
+        menu_mode(th().light);
+    }
+    redraw();
+}
+
+/// Barra de título con los colores del tema (en Windows 10 sólo cambia entre clara y oscura).
+unsafe fn style_window(h: HWND) {
+    let t = th();
+    let dark: i32 = (!t.light) as i32;
+    DwmSetWindowAttribute(h, 20, &dark as *const i32 as _, 4);
+    DwmSetWindowAttribute(h, 35, &t.bg as *const u32 as _, 4); // DWMWA_CAPTION_COLOR
+    DwmSetWindowAttribute(h, 36, &t.text as *const u32 as _, 4); // DWMWA_TEXT_COLOR
+}
+
+/// Menús emergentes claros u oscuros como el tema (uxtheme: SetPreferredAppMode y FlushMenuThemes).
+unsafe fn menu_mode(light: bool) {
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    let ux = LoadLibraryW(wide("uxtheme.dll").as_ptr());
+    if ux.is_null() {
+        return;
+    }
+    if let Some(f) = GetProcAddress(ux, 135 as *const u8) {
+        let set: unsafe extern "system" fn(i32) -> i32 = std::mem::transmute(f);
+        set(if light { 3 } else { 2 }); // ForceLight / ForceDark
+    }
+    if let Some(f) = GetProcAddress(ux, 136 as *const u8) {
+        let flush: unsafe extern "system" fn() = std::mem::transmute(f);
+        flush();
+    }
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -180,6 +348,9 @@ enum Act {
     HkClear(usize),
     Diagnostics,
     FastStart,
+    Theme(u8),
+    Accent(u8),
+    Corners(bool),
 }
 
 struct Fonts {
@@ -226,6 +397,10 @@ struct Config {
     seeded: bool,
     /// Se apagaron las luces al apagar el equipo: devolverlas al arrancar.
     pending_restore: bool,
+    /// Aspecto: tema (THEME_NAMES), color de acento (ACCENTS) y esquinas rectas.
+    theme: u8,
+    accent: u8,
+    square: bool,
 }
 
 /// Hilo que funde suavemente los colores del ciclo en un mando.
@@ -397,6 +572,9 @@ fn load_config() -> Config {
                 "profile" => cfg.active_profile = f[2].to_string(),
                 "seeded" => cfg.seeded = f[2] == "1",
                 "pending_restore" => cfg.pending_restore = f[2] == "1",
+                "theme" => cfg.theme = f[2].parse().unwrap_or(0),
+                "accent" => cfg.accent = f[2].parse().unwrap_or(0),
+                "corners" => cfg.square = f[2] == "rectas",
                 _ => {}
             }
         } else if f.len() == 3 && f[0] == "#cycle" {
@@ -465,6 +643,9 @@ fn save_config(cfg: &Config) {
     text += &format!("#opt\tprofile\t{}\n", cfg.active_profile);
     text += &format!("#opt\tseeded\t{}\n", cfg.seeded as u8);
     text += &format!("#opt\tpending_restore\t{}\n", cfg.pending_restore as u8);
+    text += &format!("#opt\ttheme\t{}\n", cfg.theme);
+    text += &format!("#opt\taccent\t{}\n", cfg.accent);
+    text += &format!("#opt\tcorners\t{}\n", if cfg.square { "rectas" } else { "redondeadas" });
     for p in &cfg.profiles {
         if p.devs.is_empty() {
             text += &format!("#prof\t{}\n", p.name);
@@ -813,6 +994,16 @@ struct Painter {
     dc: HDC,
 }
 
+/// Contorno para que un color muy claro se vea sobre el fondo claro.
+fn swatch_edge(c: u32) -> Option<(u32, i32)> {
+    (th().light && luma(c) > 0.85).then_some((th().line, 1))
+}
+
+/// Radio de las esquinas según el estilo elegido (rectas: casi sin redondeo).
+fn corner(radius: i32) -> i32 {
+    if th().square { radius.min(3) } else { radius }
+}
+
 impl Painter {
     fn rect(&self, l: i32, t: i32, w: i32, h: i32) -> RECT {
         RECT { left: s(l), top: s(t), right: s(l + w), bottom: s(t + h) }
@@ -823,7 +1014,7 @@ impl Painter {
             let br = CreateSolidBrush(color);
             let old_b = SelectObject(self.dc, br);
             let old_p = SelectObject(self.dc, GetStockObject(NULL_PEN));
-            let rad = s(radius) * 2;
+            let rad = s(corner(radius)) * 2;
             RoundRect(self.dc, r.left, r.top, r.right + 1, r.bottom + 1, rad, rad);
             SelectObject(self.dc, old_b);
             SelectObject(self.dc, old_p);
@@ -836,7 +1027,7 @@ impl Painter {
             let pen = CreatePen(PS_SOLID, s(width).max(1), color);
             let old_p = SelectObject(self.dc, pen);
             let old_b = SelectObject(self.dc, GetStockObject(NULL_BRUSH));
-            let rad = s(radius) * 2;
+            let rad = s(corner(radius)) * 2;
             RoundRect(self.dc, r.left, r.top, r.right, r.bottom, rad, rad);
             SelectObject(self.dc, old_b);
             SelectObject(self.dc, old_p);
@@ -946,11 +1137,11 @@ fn glyph(d: &Device) -> &'static str {
 
 fn battery_color(pct: u8) -> u32 {
     if pct > 50 {
-        GREEN
+        th().green
     } else if pct > 20 {
-        AMBER
+        th().amber
     } else {
-        RED
+        th().red
     }
 }
 
@@ -983,7 +1174,7 @@ fn paint(p: &Painter) {
     a.hits.clear();
     a.preview = None;
     let full = p.rect(0, 0, WIN_W, WIN_H);
-    p.fill(&full, BG, 0);
+    p.fill(&full, th().bg, 0);
     paint_sidebar(p);
     let content_x = SIDEBAR_W + 28;
     let content_w = WIN_W - content_x - 28;
@@ -998,12 +1189,12 @@ fn paint(p: &Painter) {
 fn nav_item(p: &Painter, y: i32, glyph_s: &str, label: &str, active: bool, act: Act) {
     let a = app();
     let r = p.rect(14, y, SIDEBAR_W - 28, 40);
-    p.fill(&r, if active || is_hot(act) { CARD_HOT } else { SIDEBAR }, 10);
+    p.fill(&r, if active || is_hot(act) { th().card_hot } else { th().sidebar }, 10);
     if active {
-        p.fill(&p.rect(14, y + 10, 4, 20), ACCENT, 2);
+        p.fill(&p.rect(14, y + 10, 4, 20), th().accent, 2);
     }
-    p.text(glyph_s, &p.rect(30, y, 30, 40), if active { ACCENT_HOT } else { SUB }, a.fonts.icon, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    p.text(label, &p.rect(70, y, 180, 40), TEXT, a.fonts.bold, DT_SINGLELINE | DT_VCENTER);
+    p.text(glyph_s, &p.rect(30, y, 30, 40), if active { th().accent_hot } else { th().sub }, a.fonts.icon, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    p.text(label, &p.rect(70, y, 180, 40), th().text, a.fonts.bold, DT_SINGLELINE | DT_VCENTER);
     hit(r, act);
 }
 
@@ -1017,11 +1208,11 @@ fn hit_clipped(r: RECT, view: &RECT, act: Act) {
 
 fn paint_sidebar(p: &Painter) {
     let a = app();
-    p.fill(&p.rect(0, 0, SIDEBAR_W, WIN_H), SIDEBAR, 0);
+    p.fill(&p.rect(0, 0, SIDEBAR_W, WIN_H), th().sidebar, 0);
     // Logotipo
-    p.fill(&p.rect(22, 24, 36, 36), ACCENT, 10);
-    p.text("\u{E781}", &p.rect(22, 24, 36, 36), TEXT, a.fonts.icon, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    p.text("Centro LED", &p.rect(70, 22, 200, 24), TEXT, a.fonts.h2, DT_SINGLELINE);
+    p.fill(&p.rect(22, 24, 36, 36), th().accent, 10);
+    p.text("\u{E781}", &p.rect(22, 24, 36, 36), th().on_accent, a.fonts.icon, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    p.text("Centro LED", &p.rect(70, 22, 200, 24), th().text, a.fonts.h2, DT_SINGLELINE);
     paint_update(p);
 
     nav_item(p, 80, "\u{E80F}", "Inicio", a.page == 0, Act::Home);
@@ -1030,9 +1221,9 @@ fn paint_sidebar(p: &Painter) {
     section(p, &format!("DISPOSITIVOS · {}", a.devices.len()), 28, 136);
     let sr = p.rect(SIDEBAR_W - 52, 128, 30, 30);
     if is_hot(Act::Scan) {
-        p.fill(&sr, CARD_HOT, 8);
+        p.fill(&sr, th().card_hot, 8);
     }
-    p.text(if a.scanning { "\u{E895}" } else { "\u{E72C}" }, &sr, if a.scanning { ACCENT_HOT } else { SUB }, a.fonts.small_icon, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    p.text(if a.scanning { "\u{E895}" } else { "\u{E72C}" }, &sr, if a.scanning { th().accent_hot } else { th().sub }, a.fonts.small_icon, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     hit(sr, Act::Scan);
 
     // Lista con desplazamiento
@@ -1055,30 +1246,30 @@ fn paint_sidebar(p: &Painter) {
         let r = p.rect(14, y, SIDEBAR_W - 28, 62);
         let selected = a.page == 1 && a.sel.as_deref() == Some(&d.key);
         let hot = is_hot(Act::Device(i));
-        p.fill(&r, if selected || hot { CARD_HOT } else { SIDEBAR }, 10);
+        p.fill(&r, if selected || hot { th().card_hot } else { th().sidebar }, 10);
         if selected {
-            p.fill(&p.rect(14, y + 14, 4, 34), ACCENT, 2);
+            p.fill(&p.rect(14, y + 14, 4, 34), th().accent, 2);
         }
         let ic = p.rect(28, y + 11, 40, 40);
-        p.fill(&ic, if selected { ACCENT } else { CARD }, 10);
-        p.text(glyph(d), &ic, TEXT, a.fonts.icon, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        p.text(&d.name, &p.rect(80, y + 10, SIDEBAR_W - 28 - 76, 20), TEXT, a.fonts.bold, DT_SINGLELINE | DT_END_ELLIPSIS);
+        p.fill(&ic, if selected { th().accent } else { th().card }, 10);
+        p.text(glyph(d), &ic, if selected { th().on_accent } else { th().text }, a.fonts.icon, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        p.text(&d.name, &p.rect(80, y + 10, SIDEBAR_W - 28 - 76, 20), th().text, a.fonts.bold, DT_SINGLELINE | DT_END_ELLIPSIS);
         match d.battery {
             Some(b) => {
-                p.fill(&p.rect(80, y + 39, 96, 6), LINE, 3);
+                p.fill(&p.rect(80, y + 39, 96, 6), th().line, 3);
                 p.fill(&p.rect(80, y + 39, (96 * b.pct as i32 / 100).max(4), 6), battery_color(b.pct), 3);
                 let label = if b.charging { format!("{} % ⚡", b.pct) } else if b.approx { format!("≈{} %", b.pct) } else { format!("{} %", b.pct) };
-                p.text(&label, &p.rect(184, y + 32, 70, 20), SUB, a.fonts.small, DT_SINGLELINE | DT_VCENTER);
+                p.text(&label, &p.rect(184, y + 32, 70, 20), th().sub, a.fonts.small, DT_SINGLELINE | DT_VCENTER);
             }
             None if last_battery(d).is_some() => {
                 let pct = last_battery(d).unwrap();
-                p.fill(&p.rect(80, y + 39, 96, 6), LINE, 3);
-                p.fill(&p.rect(80, y + 39, (96 * pct as i32 / 100).max(4), 6), mix(LINE, battery_color(pct), 0.45), 3);
-                p.text(&format!("{} % · zZ", pct), &p.rect(184, y + 32, 70, 20), SUB, a.fonts.small, DT_SINGLELINE | DT_VCENTER);
+                p.fill(&p.rect(80, y + 39, 96, 6), th().line, 3);
+                p.fill(&p.rect(80, y + 39, (96 * pct as i32 / 100).max(4), 6), mix(th().line, battery_color(pct), 0.45), 3);
+                p.text(&format!("{} % · zZ", pct), &p.rect(184, y + 32, 70, 20), th().sub, a.fonts.small, DT_SINGLELINE | DT_VCENTER);
             }
             None => {
                 let note = if d.battery_note.is_empty() || d.battery_note == "—" { d.conn } else { d.battery_note };
-                p.text(&format!("{} · {}", d.kind, note), &p.rect(80, y + 32, SIDEBAR_W - 28 - 76, 20), SUB, a.fonts.small, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+                p.text(&format!("{} · {}", d.kind, note), &p.rect(80, y + 32, SIDEBAR_W - 28 - 76, 20), th().sub, a.fonts.small, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
             }
         }
         hit_clipped(r, &view, Act::Device(i));
@@ -1086,17 +1277,17 @@ fn paint_sidebar(p: &Painter) {
     }
     if a.devices.is_empty() {
         let msg = if a.scanning { "Buscando…" } else { "No se encontraron dispositivos" };
-        p.text(msg, &p.rect(28, view_top + 8, SIDEBAR_W - 56, 24), SUB, a.fonts.body, DT_SINGLELINE);
+        p.text(msg, &p.rect(28, view_top + 8, SIDEBAR_W - 56, 24), th().sub, a.fonts.body, DT_SINGLELINE);
     }
     unsafe {
         RestoreDC(p.dc, -1);
     }
     // Sombra suave cuando hay más elementos debajo / encima
     if a.list_scroll < a.list_max {
-        p.fill(&p.rect(14, view_bottom - 2, SIDEBAR_W - 28, 2), LINE, 1);
+        p.fill(&p.rect(14, view_bottom - 2, SIDEBAR_W - 28, 2), th().line, 1);
     }
     if a.list_scroll > 0 {
-        p.fill(&p.rect(14, view_top, SIDEBAR_W - 28, 2), LINE, 1);
+        p.fill(&p.rect(14, view_top, SIDEBAR_W - 28, 2), th().line, 1);
     }
 
     nav_item(p, WIN_H - 60, "\u{E713}", "Ajustes", a.page == 2, Act::Settings);
@@ -1105,14 +1296,14 @@ fn paint_sidebar(p: &Painter) {
 /// Página de inicio: una tarjeta por dispositivo con su batería y estado de luces.
 fn paint_home(p: &Painter, x: i32, w: i32) {
     let a = app();
-    p.text("Resumen", &p.rect(x, 22, w, 34), TEXT, a.fonts.title, DT_SINGLELINE);
+    p.text("Resumen", &p.rect(x, 22, w, 34), th().text, a.fonts.title, DT_SINGLELINE);
     let with_bat = a.devices.iter().filter(|d| d.battery.is_some()).count();
     let sub = if a.status.is_empty() {
         format!("{} dispositivos · {} con batería", a.devices.len(), with_bat)
     } else {
         a.status.clone()
     };
-    p.text(&sub, &p.rect(x, 58, w, 20), SUB, a.fonts.body, DT_SINGLELINE | DT_END_ELLIPSIS);
+    p.text(&sub, &p.rect(x, 58, w, 20), th().sub, a.fonts.body, DT_SINGLELINE | DT_END_ELLIPSIS);
     paint_home_bar(p, x, w);
 
     let cols = 3;
@@ -1127,7 +1318,7 @@ fn paint_home(p: &Painter, x: i32, w: i32) {
     a.home_scroll = a.home_scroll.clamp(0, a.home_max);
     if a.devices.is_empty() {
         let msg = if a.scanning { "Buscando dispositivos…" } else { "No se encontraron dispositivos. Conecta alguno y pulsa el botón de buscar." };
-        p.text(msg, &p.rect(x, 140, w, 30), SUB, a.fonts.h2, DT_SINGLELINE);
+        p.text(msg, &p.rect(x, 140, w, 30), th().sub, a.fonts.h2, DT_SINGLELINE);
         return;
     }
     unsafe {
@@ -1143,30 +1334,31 @@ fn paint_home(p: &Painter, x: i32, w: i32) {
         }
         let r = p.rect(cx, cy, cw, ch);
         let hot = is_hot(Act::Device(i));
-        p.fill(&r, if hot { CARD_HOT } else { CARD }, 14);
+        p.fill(&r, if hot { th().card_hot } else { th().card }, 14);
+        p.stroke(&r, if hot { mix(th().border, th().accent, 0.7) } else { th().border }, 14, 1);
         // Icono con el color de sus luces (si las tiene y están guardadas)
         let led_col = a.config.led.get(&d.key).filter(|s| s.mode != MODE_OFF).map(|s| rgb(s.rgb.0, s.rgb.1, s.rgb.2));
         let ic = p.rect(cx + 16, cy + 16, 44, 44);
-        p.fill(&ic, led_col.map(|c| mix(BG, c, 0.55)).unwrap_or(LINE), 12);
-        p.text(glyph(d), &ic, TEXT, a.fonts.icon, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        p.text(&d.name, &p.rect(cx + 72, cy + 16, cw - 88, 22), TEXT, a.fonts.bold, DT_SINGLELINE | DT_END_ELLIPSIS);
-        p.text(&format!("{} · {}", d.kind, d.conn), &p.rect(cx + 72, cy + 38, cw - 88, 20), SUB, a.fonts.small, DT_SINGLELINE | DT_END_ELLIPSIS);
+        p.fill(&ic, led_col.map(|c| mix(th().bg, c, 0.55)).unwrap_or(th().line), 12);
+        p.text(glyph(d), &ic, th().text, a.fonts.icon, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        p.text(&d.name, &p.rect(cx + 72, cy + 16, cw - 88, 22), th().text, a.fonts.bold, DT_SINGLELINE | DT_END_ELLIPSIS);
+        p.text(&format!("{} · {}", d.kind, d.conn), &p.rect(cx + 72, cy + 38, cw - 88, 20), th().sub, a.fonts.small, DT_SINGLELINE | DT_END_ELLIPSIS);
         // Batería o estado
         let by = cy + 78;
         let bat = d.battery.map(|b| (b.pct, b.charging, false)).or_else(|| last_battery(d).map(|p| (p, false, true)));
         match bat {
             Some((pct, charging, stale)) => {
-                let col = if stale { mix(LINE, battery_color(pct), 0.45) } else { battery_color(pct) };
-                p.text(&format!("{} %", pct), &p.rect(cx + 16, by, 120, 30), TEXT, a.fonts.h2, DT_SINGLELINE | DT_VCENTER);
+                let col = if stale { mix(th().line, battery_color(pct), 0.45) } else { battery_color(pct) };
+                p.text(&format!("{} %", pct), &p.rect(cx + 16, by, 120, 30), th().text, a.fonts.h2, DT_SINGLELINE | DT_VCENTER);
                 let est = if stale { None } else { history::estimate_text(d) };
                 let note = est.unwrap_or_else(|| (if charging { "cargando ⚡" } else if stale { "último valor · dormido" } else { "batería" }).to_string());
-                p.text(&note, &p.rect(cx + 84, by, cw - 100, 30), SUB, a.fonts.small, DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_END_ELLIPSIS);
-                p.fill(&p.rect(cx + 16, by + 36, cw - 32, 8), LINE, 4);
+                p.text(&note, &p.rect(cx + 84, by, cw - 100, 30), th().sub, a.fonts.small, DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_END_ELLIPSIS);
+                p.fill(&p.rect(cx + 16, by + 36, cw - 32, 8), th().line, 4);
                 p.fill(&p.rect(cx + 16, by + 36, ((cw - 32) * pct as i32 / 100).max(8), 8), col, 4);
             }
             None => {
                 let note = if d.battery_note.is_empty() || d.battery_note == "—" { "Sin batería" } else { d.battery_note };
-                p.text(note, &p.rect(cx + 16, by, cw - 32, 24), SUB, a.fonts.body, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+                p.text(note, &p.rect(cx + 16, by, cw - 32, 24), th().sub, a.fonts.body, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
             }
         }
         if d.led.is_some() {
@@ -1183,7 +1375,7 @@ fn paint_home(p: &Painter, x: i32, w: i32) {
                     p.circle(&p.rect(cx + 16, ly + 5, 10, 10), c, None);
                 }
                 let lx = if led_col.is_some() { cx + 32 } else { cx + 16 };
-                p.text(&label, &p.rect(lx, ly, cw - 48, 20), SUB, a.fonts.small, DT_SINGLELINE | DT_VCENTER);
+                p.text(&label, &p.rect(lx, ly, cw - 48, 20), th().sub, a.fonts.small, DT_SINGLELINE | DT_VCENTER);
             }
         }
         hit_clipped(r, &view, Act::Device(i));
@@ -1195,7 +1387,7 @@ fn paint_home(p: &Painter, x: i32, w: i32) {
 
 /// Botón redondeado con texto (chip). Devuelve su ancho lógico.
 fn chip(p: &Painter, label: &str, x: i32, y: i32, h: i32, on: bool, act: Act) -> i32 {
-    chip_bg(p, label, x, y, h, on, act, CARD)
+    chip_bg(p, label, x, y, h, on, act, th().card)
 }
 
 /// Igual que `chip` pero sobre otro fondo (dentro de una tarjeta se usa LINE para que se vea).
@@ -1203,9 +1395,13 @@ fn chip_bg(p: &Painter, label: &str, x: i32, y: i32, h: i32, on: bool, act: Act,
     let a = app();
     let tw = p.measure(label, a.fonts.body) + 28;
     let r = p.rect(x, y, tw, h);
-    let hot = if bg == LINE { rgb(0x44, 0x44, 0x58) } else { CARD_HOT };
-    p.fill(&r, if on { ACCENT } else if is_hot(act) { hot } else { bg }, h / 2);
-    p.text(label, &r, TEXT, a.fonts.body, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    let on_card = bg == th().line;
+    let hot = if on_card { mix(th().line, th().text, 0.12) } else { th().card_hot };
+    p.fill(&r, if on { th().accent } else if is_hot(act) { hot } else { bg }, h / 2);
+    if !on && !on_card {
+        p.stroke(&r, th().border, h / 2, 1);
+    }
+    p.text(label, &r, if on { th().on_accent } else { th().text }, a.fonts.body, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     hit(r, act);
     tw
 }
@@ -1225,9 +1421,9 @@ fn paint_home_bar(p: &Painter, x: i32, w: i32) {
         for c in ALL {
             let r = p.rect(cx + 3, ty + 23, 24, 24);
             if is_hot(Act::AllColor(c)) {
-                p.circle(&p.rect(cx, ty + 20, 30, 30), BG, Some((SUB, 2)));
+                p.circle(&p.rect(cx, ty + 20, 30, 30), th().bg, Some((th().sub, 2)));
             }
-            p.circle(&r, to_ref(c), None);
+            p.circle(&r, to_ref(c), swatch_edge(to_ref(c)));
             hit(r, Act::AllColor(c));
             cx += 30;
         }
@@ -1251,10 +1447,10 @@ fn paint_home_bar(p: &Painter, x: i32, w: i32) {
 /// Fila de ajuste con interruptor, título y descripción.
 fn setting_row(p: &Painter, x: i32, y: i32, w: i32, title: &str, desc: &str, on: bool, act: Act) -> i32 {
     let a = app();
-    p.text(title, &p.rect(x + 20, y + 14, w - 110, 22), TEXT, a.fonts.bold, DT_SINGLELINE);
+    p.text(title, &p.rect(x + 20, y + 14, w - 110, 22), th().text, a.fonts.bold, DT_SINGLELINE);
     let lines = if desc.is_empty() { 0 } else { 2 };
     if lines > 0 {
-        p.text(desc, &p.rect(x + 20, y + 36, w - 110, 36), SUB, a.fonts.small, DT_WORDBREAK);
+        p.text(desc, &p.rect(x + 20, y + 36, w - 110, 36), th().sub, a.fonts.small, DT_WORDBREAK);
     }
     paint_switch(p, x + w - 62, y + 18, on, act);
     y + if lines > 0 { 80 } else { 50 }
@@ -1262,14 +1458,118 @@ fn setting_row(p: &Painter, x: i32, y: i32, w: i32, title: &str, desc: &str, on:
 
 fn card(p: &Painter, x: i32, y: i32, w: i32, h: i32, title: &str) {
     section(p, title, x, y);
-    p.fill(&p.rect(x, y + 22, w, h), CARD, 14);
+    let r = p.rect(x, y + 22, w, h);
+    p.fill(&r, th().card, 14);
+    p.stroke(&r, th().border, 14, 1);
+}
+
+/// Miniatura de la ventana con los colores de un tema (con el acento actual).
+fn theme_thumb(p: &Painter, b: &Base, x: i32, y: i32, w: i32, h: i32) {
+    let acc = th().accent;
+    let (bg, side, card, line, text, sub) = (b.c[0], b.c[1], b.c[2], b.c[4], b.c[6], b.c[7]);
+    p.fill(&p.rect(x, y, w, h), bg, 8);
+    let sw = w * 30 / 100;
+    p.fill(&p.rect(x, y, sw, h), side, 8);
+    p.fill(&p.rect(x + sw - 8, y, 8, h), side, 0);
+    p.fill(&p.rect(x + 6, y + 7, 8, 8), acc, 2);
+    for (i, lw) in [16, 12, 14].iter().enumerate() {
+        p.fill(&p.rect(x + 6, y + 22 + i as i32 * 9, *lw, 3), if i == 0 { text } else { sub }, 1);
+    }
+    let cx = x + sw + 7;
+    let cw = (w - sw - 19) / 2;
+    p.fill(&p.rect(cx, y + 7, 28, 4), text, 2);
+    for k in 0..2 {
+        let r = p.rect(cx + k * (cw + 5), y + 18, cw, h - 26);
+        p.fill(&r, card, 5);
+        p.fill(&p.rect(cx + k * (cw + 5) + 5, y + 24, cw - 14, 3), sub, 1);
+        p.fill(&p.rect(cx + k * (cw + 5) + 5, y + h - 16, cw - 10, 4), line, 2);
+        p.fill(&p.rect(cx + k * (cw + 5) + 5, y + h - 16, (cw - 10) * if k == 0 { 70 } else { 40 } / 100, 4), acc, 2);
+    }
+    p.stroke(&p.rect(x, y, w, h), if b.light { b.c[5] } else { mix(line, bg, 0.3) }, 8, 1);
+}
+
+/// Ajustes › Apariencia: tema, color de acento y esquinas. Devuelve dónde empieza lo siguiente.
+fn paint_appearance(p: &Painter, x: i32, y: i32, w: i32) -> i32 {
+    let a = app();
+    let h = 190;
+    card(p, x, y, w, h, "APARIENCIA");
+    // Temas
+    let n = THEME_NAMES.len() as i32;
+    let gap = 14;
+    let tw = (w - 40 - gap * (n - 1)) / n;
+    let (ty, tht) = (y + 42, 64);
+    for i in 0..n {
+        let tx = x + 20 + i * (tw + gap);
+        let act = Act::Theme(i as u8);
+        let on = a.config.theme == i as u8;
+        if i as u8 == THEME_SYSTEM {
+            // Mitad oscura y mitad clara
+            let half = p.rect(tx, ty, tw / 2, tht);
+            unsafe {
+                SaveDC(p.dc);
+                IntersectClipRect(p.dc, half.left, half.top, half.right, half.bottom);
+            }
+            theme_thumb(p, &BASES[0], tx, ty, tw, tht);
+            unsafe {
+                RestoreDC(p.dc, -1);
+                SaveDC(p.dc);
+                IntersectClipRect(p.dc, half.right, half.top, s(tx + tw) + 1, half.bottom + 1);
+            }
+            theme_thumb(p, &BASES[4], tx, ty, tw, tht);
+            unsafe {
+                RestoreDC(p.dc, -1);
+            }
+        } else {
+            theme_thumb(p, &BASES[i as usize], tx, ty, tw, tht);
+        }
+        if on || is_hot(act) {
+            p.stroke(&p.rect(tx - 4, ty - 4, tw + 8, tht + 8), if on { th().accent } else { th().sub }, 11, 2);
+        }
+        p.text(THEME_NAMES[i as usize], &p.rect(tx - 6, ty + tht + 7, tw + 12, 18), if on { th().text } else { th().sub }, if on { a.fonts.bold } else { a.fonts.small }, DT_CENTER | DT_SINGLELINE);
+        hit(p.rect(tx - 4, ty - 4, tw + 8, tht + 30), act);
+    }
+    // Color de acento
+    let ay = y + 154;
+    let shown = match a.hot {
+        Some(Act::Accent(i)) => i,
+        _ => a.config.accent,
+    };
+    section(p, &format!("COLOR DE ACENTO · {}", ACCENTS[shown as usize].0.to_uppercase()), x + 20, ay);
+    let mut cx = x + 20;
+    for (i, (_, c)) in ACCENTS.iter().enumerate() {
+        let act = Act::Accent(i as u8);
+        let on = a.config.accent == i as u8;
+        let col = if i as u8 == ACCENT_WINDOWS { windows_accent() } else { *c };
+        if on || is_hot(act) {
+            p.circle(&p.rect(cx - 4, ay + 22, 36, 36), th().card, Some((if on { th().text } else { th().sub }, 2)));
+        }
+        let r = p.rect(cx, ay + 26, 28, 28);
+        p.circle(&r, col, None);
+        if i as u8 == ACCENT_WINDOWS {
+            // Cuatro cuadritos: el color de Windows
+            let fg = if luma(col) > 0.62 { rgb(0x14, 0x14, 0x18) } else { rgb(0xFF, 0xFF, 0xFF) };
+            for (dx, dy) in [(0, 0), (5, 0), (0, 5), (5, 5)] {
+                p.fill(&p.rect(cx + 9 + dx, ay + 35 + dy, 4, 4), fg, 0);
+            }
+        }
+        hit(r, act);
+        cx += 40;
+    }
+    // Esquinas
+    let ex = x + 20 + ACCENTS.len() as i32 * 40 + 40;
+    section(p, "ESQUINAS", ex, ay);
+    let mut bx = ex;
+    for (label, sq) in [("Redondeadas", false), ("Rectas", true)] {
+        bx += chip_bg(p, label, bx, ay + 25, 30, a.config.square == sq, Act::Corners(sq), th().line) + 8;
+    }
+    y + h + 40
 }
 
 /// Página de ajustes (se desplaza con la rueda si no cabe).
 fn paint_settings(p: &Painter, x: i32, w: i32) {
     let a = app();
-    p.text("Ajustes", &p.rect(x, 22, w, 34), TEXT, a.fonts.title, DT_SINGLELINE);
-    p.text(if portable_dir().is_some() { "Versión portable · la configuración se guarda junto al programa" } else { "Se guardan al momento" }, &p.rect(x, 58, w, 20), SUB, a.fonts.body, DT_SINGLELINE);
+    p.text("Ajustes", &p.rect(x, 22, w, 34), th().text, a.fonts.title, DT_SINGLELINE);
+    p.text(if portable_dir().is_some() { "Versión portable · la configuración se guarda junto al programa" } else { "Se guardan al momento" }, &p.rect(x, 58, w, 20), th().sub, a.fonts.body, DT_SINGLELINE);
     let view_top = 86;
     let view_bottom = WIN_H - 8;
     let view = p.rect(x - 8, view_top, w + 16, view_bottom - view_top);
@@ -1278,7 +1578,7 @@ fn paint_settings(p: &Painter, x: i32, w: i32) {
         IntersectClipRect(p.dc, view.left, view.top, view.right, view.bottom);
     }
     a.clip = Some(view);
-    let top = view_top + 10 - a.set_scroll;
+    let top = paint_appearance(p, x, view_top + 10 - a.set_scroll, w);
     let half = (w - 20) / 2;
 
     // Columna izquierda
@@ -1293,12 +1593,12 @@ fn paint_settings(p: &Painter, x: i32, w: i32) {
         let tw = p.measure(label, a.fonts.body) + 26;
         let r = p.rect(cx, y + 40, tw, 30);
         let on = a.config.low_battery == v;
-        p.fill(&r, if on { ACCENT } else if is_hot(Act::LowBattery(v)) { CARD_HOT } else { LINE }, 15);
-        p.text(label, &r, TEXT, a.fonts.body, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        p.fill(&r, if on { th().accent } else if is_hot(Act::LowBattery(v)) { mix(th().line, th().text, 0.12) } else { th().line }, 15);
+        p.text(label, &r, if on { th().on_accent } else { th().text }, a.fonts.body, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         hit(r, Act::LowBattery(v));
         cx += tw + 8;
     }
-    p.text("Aviso de Windows al bajar de ese nivel sin cargar.", &p.rect(x + 20, y + 80, half - 40, 20), SUB, a.fonts.small, DT_SINGLELINE | DT_END_ELLIPSIS);
+    p.text("Aviso de Windows al bajar de ese nivel sin cargar.", &p.rect(x + 20, y + 80, half - 40, 20), th().sub, a.fonts.small, DT_SINGLELINE | DT_END_ELLIPSIS);
     y += 136;
     card(p, x, y, half, 130, "INICIO");
     let yy = setting_row(p, x, y + 22, half, "Iniciar con Windows", "", a.autostart || a.config.fast_start, Act::Autostart);
@@ -1312,26 +1612,26 @@ fn paint_settings(p: &Painter, x: i32, w: i32) {
         let rec = a.recording.as_deref() == Some(action.as_str());
         let hk = state::hotkey_of(action);
         let (txt, col) = match hk {
-            _ if rec => ("Pulsa la combinación… (Esc cancela)".to_string(), AMBER),
-            Some(h) if a.hk_failed.contains(action) => (format!("{} · en uso por otro programa", state::combo_name(h.mods, h.vk)), RED),
-            Some(h) => (state::combo_name(h.mods, h.vk), ACCENT_HOT),
-            None => ("Sin atajo".to_string(), SUB),
+            _ if rec => ("Pulsa la combinación… (Esc cancela)".to_string(), th().amber),
+            Some(h) if a.hk_failed.contains(action) => (format!("{} · en uso por otro programa", state::combo_name(h.mods, h.vk)), th().red),
+            Some(h) => (state::combo_name(h.mods, h.vk), th().accent_hot),
+            None => ("Sin atajo".to_string(), th().sub),
         };
         // Botones a la derecha
         let mut bx = x + half - 16;
         if hk.is_some() && !rec {
             bx -= p.measure("Quitar", a.fonts.body) + 28;
-            chip_bg(p, "Quitar", bx, ry + 6, 30, false, Act::HkClear(i), LINE);
+            chip_bg(p, "Quitar", bx, ry + 6, 30, false, Act::HkClear(i), th().line);
             bx -= 8;
         }
         let lbl = if rec { "Cancelar" } else if hk.is_some() { "Cambiar" } else { "Grabar" };
         bx -= p.measure(lbl, a.fonts.body) + 28;
-        chip_bg(p, lbl, bx, ry + 6, 30, rec, Act::HkRecord(i), LINE);
-        p.text(label, &p.rect(x + 20, ry, bx - x - 28, 22), TEXT, a.fonts.bold, DT_SINGLELINE | DT_END_ELLIPSIS);
+        chip_bg(p, lbl, bx, ry + 6, 30, rec, Act::HkRecord(i), th().line);
+        p.text(label, &p.rect(x + 20, ry, bx - x - 28, 22), th().text, a.fonts.bold, DT_SINGLELINE | DT_END_ELLIPSIS);
         p.text(&txt, &p.rect(x + 20, ry + 22, bx - x - 28, 18), col, a.fonts.small, DT_SINGLELINE | DT_END_ELLIPSIS);
         ry += 52;
     }
-    p.text("Pulsa Grabar y luego la combinación, p. ej. Ctrl + Alt + L.", &p.rect(x + 20, ry, half - 40, 20), SUB, a.fonts.small, DT_SINGLELINE | DT_END_ELLIPSIS);
+    p.text("Pulsa Grabar y luego la combinación, p. ej. Ctrl + Alt + L.", &p.rect(x + 20, ry, half - 40, 20), th().sub, a.fonts.small, DT_SINGLELINE | DT_END_ELLIPSIS);
     let left_end = y + 22 + hh;
 
     // Columna derecha
@@ -1356,45 +1656,45 @@ fn paint_settings(p: &Painter, x: i32, w: i32) {
     for (n, title) in ["Al bloquear el equipo (Win + L)", "Al apagarse la pantalla", "Al suspender el equipo", "Al apagar el equipo o cerrar sesión"].iter().enumerate() {
         yy = setting_row(p, rx, yy, half, title, "", a.config.auto[n], Act::AutoOpt(n as u8));
     }
-    p.text("QUÉ SE APAGA · EL TECLADO NUNCA", &p.rect(rx + 20, yy + 6, half - 40, 18), SUB, a.fonts.small, DT_SINGLELINE);
+    p.text("QUÉ SE APAGA · EL TECLADO NUNCA", &p.rect(rx + 20, yy + 6, half - 40, 18), th().sub, a.fonts.small, DT_SINGLELINE);
     let base = yy + 30;
     if devs.is_empty() {
-        p.text("Conecta un dispositivo con luces.", &p.rect(rx + 20, base, half - 40, 22), SUB, a.fonts.small, DT_SINGLELINE);
+        p.text("Conecta un dispositivo con luces.", &p.rect(rx + 20, base, half - 40, 22), th().sub, a.fonts.small, DT_SINGLELINE);
     }
     for (i, cx, cy, tw) in chips {
         let d = &a.devices[i];
         let configured = a.config.led.contains_key(&d.key);
         let on = configured && !a.config.auto_exclude.contains(&d.key);
         let r = p.rect(cx, base + cy, tw, 28);
-        p.fill(&r, if on { ACCENT } else if is_hot(Act::AutoDev(i)) { CARD_HOT } else { LINE }, 14);
-        p.text(&d.name, &RECT { left: r.left + s(10), right: r.right - s(10), ..r }, if configured { TEXT } else { SUB }, a.fonts.small, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        p.fill(&r, if on { th().accent } else if is_hot(Act::AutoDev(i)) { mix(th().line, th().text, 0.12) } else { th().line }, 14);
+        p.text(&d.name, &RECT { left: r.left + s(10), right: r.right - s(10), ..r }, if on { th().on_accent } else if configured { th().text } else { th().sub }, a.fonts.small, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         hit(r, Act::AutoDev(i));
     }
-    p.text("Sólo los que tienen sus luces guardadas en Centro LED.", &p.rect(rx + 20, base + chips_h + 6, half - 40, 20), SUB, a.fonts.small, DT_SINGLELINE | DT_END_ELLIPSIS);
+    p.text("Sólo los que tienen sus luces guardadas en Centro LED.", &p.rect(rx + 20, base + chips_h + 6, half - 40, 20), th().sub, a.fonts.small, DT_SINGLELINE | DT_END_ELLIPSIS);
     y += ah + 40;
     let orgb = a.devices.iter().filter(|d| d.conn == "OpenRGB").count();
     card(p, rx, y, half, 176, "OPENRGB · PLACA BASE, RAM, GRÁFICA…");
-    let (status, col) = if orgb > 0 { (format!("● Conectado · {} dispositivo{}", orgb, if orgb == 1 { "" } else { "s" }), GREEN) } else { ("● No detectado".to_string(), SUB) };
+    let (status, col) = if orgb > 0 { (format!("● Conectado · {} dispositivo{}", orgb, if orgb == 1 { "" } else { "s" }), th().green) } else { ("● No detectado".to_string(), th().sub) };
     p.text(&status, &p.rect(rx + 20, y + 36, half - 40, 22), col, a.fonts.bold, DT_SINGLELINE);
     p.text(
         "Instala OpenRGB, abre la pestaña SDK Server y pulsa Start Server (puedes hacer que arranque minimizado con el servidor). Sus dispositivos aparecerán aquí.",
         &p.rect(rx + 20, y + 64, half - 40, 120),
-        SUB,
+        th().sub,
         a.fonts.small,
         DT_WORDBREAK,
     );
     y += 216;
     card(p, rx, y, half, 118, "DIAGNÓSTICO");
-    p.text("Informe de tus dispositivos para investigar un problema. Se guarda donde elijas y no se envía a ningún sitio.", &p.rect(rx + 20, y + 34, half - 40, 40), SUB, a.fonts.small, DT_WORDBREAK);
+    p.text("Informe de tus dispositivos para investigar un problema. Se guarda donde elijas y no se envía a ningún sitio.", &p.rect(rx + 20, y + 34, half - 40, 40), th().sub, a.fonts.small, DT_WORDBREAK);
     let label = "Exportar diagnóstico…";
     let tw = p.measure(label, a.fonts.body) + 32;
     let b = p.rect(rx + 20, y + 80, tw, 34);
-    p.fill(&b, if is_hot(Act::Diagnostics) { CARD_HOT } else { LINE }, 10);
-    p.text(label, &b, TEXT, a.fonts.body, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    p.fill(&b, if is_hot(Act::Diagnostics) { mix(th().line, th().text, 0.12) } else { th().line }, 10);
+    p.text(label, &b, th().text, a.fonts.body, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     hit(b, Act::Diagnostics);
     y += 158;
     card(p, rx, y, half, 128, "ACERCA DE");
-    p.text(&format!("Centro LED {}", update::VERSION), &p.rect(rx + 20, y + 36, half - 40, 22), TEXT, a.fonts.bold, DT_SINGLELINE);
+    p.text(&format!("Centro LED {}", update::VERSION), &p.rect(rx + 20, y + 36, half - 40, 22), th().text, a.fonts.bold, DT_SINGLELINE);
     let state = match &a.upd {
         Upd::Available(r) => format!("Hay una versión nueva: {}", r.version),
         Upd::Checking => "Comprobando actualizaciones…".into(),
@@ -1404,16 +1704,16 @@ fn paint_settings(p: &Painter, x: i32, w: i32) {
         Upd::Error(_) => "No se pudo comprobar (sin conexión)".into(),
         Upd::Idle => "Se actualiza sola desde GitHub (con firma comprobada)".into(),
     };
-    p.text(&state, &p.rect(rx + 20, y + 58, half - 40, 20), SUB, a.fonts.small, DT_SINGLELINE | DT_END_ELLIPSIS);
+    p.text(&state, &p.rect(rx + 20, y + 58, half - 40, 20), th().sub, a.fonts.small, DT_SINGLELINE | DT_END_ELLIPSIS);
     let label = if matches!(a.upd, Upd::Available(_)) { "Actualizar ahora" } else { "Buscar actualizaciones" };
     let tw = p.measure(label, a.fonts.body) + 32;
     let b = p.rect(rx + 20, y + 90, tw, 34);
-    p.fill(&b, if is_hot(Act::Update) { ACCENT_HOT } else { ACCENT }, 10);
-    p.text(label, &b, TEXT, a.fonts.body, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    p.fill(&b, if is_hot(Act::Update) { th().accent_hot } else { th().accent }, 10);
+    p.text(label, &b, th().on_accent, a.fonts.body, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     hit(b, Act::Update);
     let g = p.rect(rx + 30 + tw, y + 90, 130, 34);
-    p.fill(&g, if is_hot(Act::OpenUrl) { CARD_HOT } else { LINE }, 10);
-    p.text("Ver en GitHub", &g, TEXT, a.fonts.body, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    p.fill(&g, if is_hot(Act::OpenUrl) { mix(th().line, th().text, 0.12) } else { th().line }, 10);
+    p.text("Ver en GitHub", &g, th().text, a.fonts.body, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     hit(g, Act::OpenUrl);
     let right_end = y + 22 + 128;
 
@@ -1423,10 +1723,10 @@ fn paint_settings(p: &Painter, x: i32, w: i32) {
     a.clip = None;
     a.set_max = (left_end.max(right_end) + a.set_scroll + 16 - view_bottom).max(0);
     if a.set_scroll > 0 {
-        p.fill(&p.rect(x, view_top, w, 2), LINE, 1);
+        p.fill(&p.rect(x, view_top, w, 2), th().line, 1);
     }
     if a.set_scroll < a.set_max {
-        p.fill(&p.rect(x, view_bottom - 2, w, 2), LINE, 1);
+        p.fill(&p.rect(x, view_bottom - 2, w, 2), th().line, 1);
     }
 }
 
@@ -1438,8 +1738,8 @@ fn paint_update(p: &Painter) {
         let label = format!("↓ Actualizar a v{}", rel.version);
         let w = p.measure(&label, a.fonts.small) + 18;
         let pill = p.rect(68, 43, w, 22);
-        p.fill(&pill, if is_hot(Act::Update) { ACCENT_HOT } else { ACCENT }, 11);
-        p.text(&label, &pill, TEXT, a.fonts.small, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        p.fill(&pill, if is_hot(Act::Update) { th().accent_hot } else { th().accent }, 11);
+        p.text(&label, &pill, th().on_accent, a.fonts.small, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         hit(pill, Act::Update);
         return;
     }
@@ -1453,7 +1753,7 @@ fn paint_update(p: &Painter) {
         Upd::Available(_) => unreachable!(),
     };
     let clickable = matches!(a.upd, Upd::Idle | Upd::UpToDate | Upd::Error(_));
-    let col = if clickable && is_hot(Act::Update) { TEXT } else { SUB };
+    let col = if clickable && is_hot(Act::Update) { th().text } else { th().sub };
     p.text(&format!("v{} · {}", update::VERSION, state), &r, col, a.fonts.small, DT_SINGLELINE | DT_END_ELLIPSIS);
     if clickable {
         hit(r, Act::Update);
@@ -1506,14 +1806,19 @@ fn restart_into(exe: &std::path::Path) {
 
 fn paint_switch(p: &Painter, x: i32, y: i32, on: bool, act: Act) {
     let r = p.rect(x, y, 38, 20);
-    p.fill(&r, if on { ACCENT } else { LINE }, 10);
+    p.fill(&r, if on { th().accent } else { th().line }, 10);
     let kx = if on { x + 21 } else { x + 3 };
-    p.circle(&p.rect(kx, y + 3, 14, 14), TEXT, None);
+    let knob = if on { th().on_accent } else if th().light { th().sub } else { th().text };
+    if th().square {
+        p.fill(&p.rect(kx, y + 3, 14, 14), knob, 2);
+    } else {
+        p.circle(&p.rect(kx, y + 3, 14, 14), knob, None);
+    }
     hit(p.rect(x - 4, y - 4, 46, 28), act);
 }
 
 fn section(p: &Painter, title: &str, x: i32, y: i32) {
-    p.text(title, &p.rect(x, y, 640, 18), SUB, app().fonts.small, DT_SINGLELINE);
+    p.text(title, &p.rect(x, y, 640, 18), th().sub, app().fonts.small, DT_SINGLELINE);
 }
 
 fn paint_device(p: &Painter, d: &Device, x: i32, w: i32) {
@@ -1533,12 +1838,12 @@ fn paint_device(p: &Painter, d: &Device, x: i32, w: i32) {
         chip(p, &label, bx, 26, 32, false, Act::DevProfiles);
         bx -= 8;
     }
-    p.text(&d.name, &p.rect(x, 22, bx - x - 12, 34), TEXT, a.fonts.title, DT_SINGLELINE | DT_END_ELLIPSIS);
+    p.text(&d.name, &p.rect(x, 22, bx - x - 12, 34), th().text, a.fonts.title, DT_SINGLELINE | DT_END_ELLIPSIS);
     let mut sub = format!("{} · {}", d.kind, d.conn);
     if d.battery.is_some() {
         sub += &format!(" · batería {}", battery_text(d));
     }
-    p.text(&sub, &p.rect(x, 58, w, 20), SUB, a.fonts.body, DT_SINGLELINE);
+    p.text(&sub, &p.rect(x, 58, w, 20), th().sub, a.fonts.body, DT_SINGLELINE);
 
     let Some(caps) = d.led.clone() else {
         paint_battery_only(p, d, x, w);
@@ -1555,21 +1860,22 @@ fn paint_device(p: &Painter, d: &Device, x: i32, w: i32) {
     if !tab_names.is_empty() {
         let widths: Vec<i32> = tab_names.iter().map(|n| (p.measure(n, a.fonts.bold) + 40).max(116)).collect();
         let tabs = p.rect(x, y, widths.iter().sum::<i32>() + 8, 36);
-        p.fill(&tabs, CARD, 10);
+        p.fill(&tabs, th().card, 10);
+        p.stroke(&tabs, th().border, 10, 1);
         let mut tx = x + 4;
         for (i, name) in tab_names.iter().enumerate() {
             let r = p.rect(tx, y + 4, widths[i], 28);
             if a.tab == i as u8 {
-                p.fill(&r, ACCENT, 8);
+                p.fill(&r, th().accent, 8);
             } else if is_hot(Act::Tab(i as u8)) {
-                p.fill(&r, CARD_HOT, 8);
+                p.fill(&r, th().card_hot, 8);
             }
-            p.text(name, &r, TEXT, a.fonts.bold, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            p.text(name, &r, if a.tab == i as u8 { th().on_accent } else { th().text }, a.fonts.bold, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             hit(r, Act::Tab(i as u8));
             tx += widths[i];
         }
         if !keyboard {
-            p.text("Cada zona tiene su propio efecto y color", &p.rect(tx + 20, y, 400, 36), SUB, a.fonts.small, DT_SINGLELINE | DT_VCENTER);
+            p.text("Cada zona tiene su propio efecto y color", &p.rect(tx + 20, y, 400, 36), th().sub, a.fonts.small, DT_SINGLELINE | DT_VCENTER);
         }
     }
     if keyboard {
@@ -1604,8 +1910,11 @@ fn paint_device(p: &Painter, d: &Device, x: i32, w: i32) {
             }
             let r = p.rect(cx, y, tw, 30);
             let on = e.mode == id;
-            p.fill(&r, if on { ACCENT } else if is_hot(Act::Mode(id)) { CARD_HOT } else { CARD }, 15);
-            p.text(name, &r, if on { TEXT } else { mix(SUB, TEXT, 0.5) }, a.fonts.body, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            p.fill(&r, if on { th().accent } else if is_hot(Act::Mode(id)) { th().card_hot } else { th().card }, 15);
+            if !on {
+                p.stroke(&r, th().border, 15, 1);
+            }
+            p.text(name, &r, if on { th().on_accent } else { mix(th().sub, th().text, 0.5) }, a.fonts.body, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             hit(r, Act::Mode(id));
             cx += tw + 8;
         }
@@ -1621,26 +1930,26 @@ fn paint_device(p: &Painter, d: &Device, x: i32, w: i32) {
             let mut cx = x;
             for (i, c) in a.cycle.iter().enumerate() {
                 let r = p.rect(cx, y, 34, 34);
-                p.circle(&r, to_ref(*c), Some((TEXT, 2)));
+                p.circle(&r, to_ref(*c), Some((th().text, 2)));
                 if is_hot(Act::CycleRemove(i)) {
-                    p.circle(&r, mix(to_ref(*c), BG, 0.55), Some((TEXT, 2)));
-                    p.text("×", &r, TEXT, a.fonts.h2, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                    p.circle(&r, mix(to_ref(*c), th().bg, 0.55), Some((th().text, 2)));
+                    p.text("×", &r, th().text, a.fonts.h2, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                 }
                 hit(r, Act::CycleRemove(i));
                 if i + 1 < a.cycle.len() {
-                    p.text("›", &p.rect(cx + 34, y, 18, 34), SUB, a.fonts.h2, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                    p.text("›", &p.rect(cx + 34, y, 18, 34), th().sub, a.fonts.h2, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                 }
                 cx += 52;
             }
             if a.cycle.len() < 2 {
-                p.text("Añade al menos 2 colores", &p.rect(cx, y, 300, 34), AMBER, a.fonts.body, DT_SINGLELINE | DT_VCENTER);
+                p.text("Añade al menos 2 colores", &p.rect(cx, y, 300, 34), th().amber, a.fonts.body, DT_SINGLELINE | DT_VCENTER);
             }
             y += 50;
         }
         let no_color = matches!(e.mode, MODE_SW_RAINBOW | MODE_OFF) || (!keyboard && matches!(e.mode, 0x03 | 0x0E));
         if no_color {
             section(p, "COLOR", x, y);
-            p.text("Este efecto recorre todos los colores por sí mismo.", &p.rect(x, y + 22, w, 30), SUB, a.fonts.body, DT_SINGLELINE | DT_VCENTER);
+            p.text("Este efecto recorre todos los colores por sí mismo.", &p.rect(x, y + 22, w, 30), th().sub, a.fonts.body, DT_SINGLELINE | DT_VCENTER);
         }
         section(p, if no_color { "" } else if custom { "COLOR DEL PINCEL" } else if cycle { "AÑADIR COLOR" } else { "COLOR" }, x, y);
         y += 22;
@@ -1650,9 +1959,9 @@ fn paint_device(p: &Painter, d: &Device, x: i32, w: i32) {
             let r = p.rect(cx, y, 30, 30);
             let current = !cycle && !e.multi && [e.rgb.0, e.rgb.1, e.rgb.2] == c;
             if current || is_hot(Act::Color(c)) {
-                p.circle(&p.rect(cx - 4, y - 4, 38, 38), BG, Some((if current { TEXT } else { SUB }, 2)));
+                p.circle(&p.rect(cx - 4, y - 4, 38, 38), th().bg, Some((if current { th().text } else { th().sub }, 2)));
             }
-            p.circle(&r, to_ref(c), None);
+            p.circle(&r, to_ref(c), swatch_edge(to_ref(c)));
             hit(r, Act::Color(c));
             cx += 40;
         }
@@ -1660,9 +1969,9 @@ fn paint_device(p: &Painter, d: &Device, x: i32, w: i32) {
         let r = if no_color { RECT { left: 0, top: 0, right: 0, bottom: 0 } } else { p.rect(cx, y, 30, 30) };
         let in_palette = cycle || PALETTE.contains(&[e.rgb.0, e.rgb.1, e.rgb.2]);
         if !no_color {
-            p.circle(&r, if in_palette { CARD } else { rgb(e.rgb.0, e.rgb.1, e.rgb.2) }, Some((if is_hot(Act::MoreColors) { TEXT } else { SUB }, 2)));
+            p.circle(&r, if in_palette { th().card } else { rgb(e.rgb.0, e.rgb.1, e.rgb.2) }, Some((if is_hot(Act::MoreColors) { th().text } else { th().sub }, 2)));
             if in_palette {
-                p.text("+", &r, TEXT, a.fonts.h2, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                p.text("+", &r, th().text, a.fonts.h2, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             }
             hit(r, Act::MoreColors);
         }
@@ -1671,14 +1980,15 @@ fn paint_device(p: &Painter, d: &Device, x: i32, w: i32) {
             for (label, act) in [("Rellenar todo", Act::FillAll), ("Apagar todo", Act::ClearAll)] {
                 let tw = p.measure(label, a.fonts.body) + 28;
                 let r = p.rect(cx, y, tw, 30);
-                p.fill(&r, if is_hot(act) { CARD_HOT } else { CARD }, 8);
-                p.text(label, &r, TEXT, a.fonts.body, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                p.fill(&r, if is_hot(act) { th().card_hot } else { th().card }, 8);
+                p.stroke(&r, th().border, 8, 1);
+                p.text(label, &r, th().text, a.fonts.body, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                 hit(r, act);
                 cx += tw + 8;
             }
         } else if caps.multicolor || rim_tab {
             paint_switch(p, cx, y + 5, e.multi, Act::Multi);
-            p.text("Arcoíris", &p.rect(cx + 46, y, 100, 30), SUB, a.fonts.body, DT_SINGLELINE | DT_VCENTER);
+            p.text("Arcoíris", &p.rect(cx + 46, y, 100, 30), th().sub, a.fonts.body, DT_SINGLELINE | DT_VCENTER);
         }
         y += 48;
 
@@ -1702,11 +2012,11 @@ fn paint_device(p: &Painter, d: &Device, x: i32, w: i32) {
     if a.dirty && !a.applying {
         status_line = format!("● Cambios sin guardar   {status}");
     }
-    p.text(&status_line, &p.rect(x, by, w - 200, 40), if a.dirty { AMBER } else { SUB }, a.fonts.small, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    p.text(&status_line, &p.rect(x, by, w - 200, 40), if a.dirty { th().amber } else { th().sub }, a.fonts.small, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
     let ar = p.rect(x + w - 180, by, 180, 40);
     let label = if a.applying { "Aplicando…" } else { "Aplicar" };
-    p.fill(&ar, if a.applying { LINE } else if is_hot(Act::Apply) { ACCENT_HOT } else { ACCENT }, 10);
-    p.text(label, &ar, TEXT, a.fonts.bold, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    p.fill(&ar, if a.applying { th().line } else if is_hot(Act::Apply) { th().accent_hot } else { th().accent }, 10);
+    p.text(label, &ar, if a.applying { th().text } else { th().on_accent }, a.fonts.bold, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     hit(ar, Act::Apply);
 }
 
@@ -1721,9 +2031,9 @@ fn paint_pad_extras(p: &Painter, x: i32, y: i32, w: i32, switch: bool) {
         for i in 0..4u8 {
             let on = a.pad.player & (1 << i) != 0;
             let r = p.rect(x + i as i32 * 30, y + 9, 14, 14);
-            p.fill(&r, if on { rgb(0x6C, 0xF0, 0x5A) } else { LINE }, 7);
+            p.fill(&r, if on { rgb(0x6C, 0xF0, 0x5A) } else { th().line }, 7);
             if is_hot(Act::PlayerLed(i)) {
-                p.stroke(&r, ACCENT, 7, 2);
+                p.stroke(&r, th().accent, 7, 2);
             }
             hit(p.rect(x + i as i32 * 30 - 6, y, 28, 32), Act::PlayerLed(i));
         }
@@ -1732,8 +2042,8 @@ fn paint_pad_extras(p: &Painter, x: i32, y: i32, w: i32, switch: bool) {
             let tw = p.measure(label, a.fonts.small) + 20;
             let r = p.rect(cx, y + 2, tw, 26);
             let on = a.pad.player_bright == n as u8;
-            p.fill(&r, if on { ACCENT } else if is_hot(Act::PlayerBright(n as u8)) { CARD_HOT } else { CARD }, 13);
-            p.text(label, &r, if on { TEXT } else { mix(SUB, TEXT, 0.5) }, a.fonts.small, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            p.fill(&r, if on { th().accent } else if is_hot(Act::PlayerBright(n as u8)) { th().card_hot } else { th().card }, 13);
+            p.text(label, &r, if on { th().on_accent } else { mix(th().sub, th().text, 0.5) }, a.fonts.small, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             hit(r, Act::PlayerBright(n as u8));
             cx += tw + 6;
         }
@@ -1745,9 +2055,12 @@ fn paint_pad_extras(p: &Painter, x: i32, y: i32, w: i32, switch: bool) {
     for i in 0..5u8 {
         let on = a.pad.player & (1 << i) != 0;
         let r = p.rect(x + i as i32 * 30, y + 9, 22, 12);
-        p.fill(&r, if on { rgb(0xF4, 0xF4, 0xFF) } else { LINE }, 6);
+        p.fill(&r, if on { rgb(0xF4, 0xF4, 0xFF) } else { th().line }, 6);
+        if on && th().light {
+            p.stroke(&r, th().sub, 6, 1);
+        }
         if is_hot(Act::PlayerLed(i)) {
-            p.stroke(&r, ACCENT, 6, 2);
+            p.stroke(&r, th().accent, 6, 2);
         }
         hit(p.rect(x + i as i32 * 30 - 4, y, 30, 30), Act::PlayerLed(i));
     }
@@ -1756,8 +2069,8 @@ fn paint_pad_extras(p: &Painter, x: i32, y: i32, w: i32, switch: bool) {
         let tw = p.measure(label, a.fonts.small) + 20;
         let r = p.rect(cx, y + 2, tw, 26);
         let on = a.pad.player_bright == n as u8;
-        p.fill(&r, if on { ACCENT } else if is_hot(Act::PlayerBright(n as u8)) { CARD_HOT } else { CARD }, 13);
-        p.text(label, &r, if on { TEXT } else { mix(SUB, TEXT, 0.5) }, a.fonts.small, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        p.fill(&r, if on { th().accent } else if is_hot(Act::PlayerBright(n as u8)) { th().card_hot } else { th().card }, 13);
+        p.text(label, &r, if on { th().on_accent } else { mix(th().sub, th().text, 0.5) }, a.fonts.small, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         hit(r, Act::PlayerBright(n as u8));
         cx += tw + 6;
     }
@@ -1766,9 +2079,9 @@ fn paint_pad_extras(p: &Painter, x: i32, y: i32, w: i32, switch: bool) {
         let tw = p.measure(label, a.fonts.small) + 20;
         let r = p.rect(cx, y + 2, tw, 26);
         let on = a.pad.mic == n as u8;
-        let col = if on { if n == 0 { ACCENT } else { rgb(0xE8, 0x6A, 0x1A) } } else if is_hot(Act::Mic(n as u8)) { CARD_HOT } else { CARD };
+        let col = if on { if n == 0 { th().accent } else { rgb(0xE8, 0x6A, 0x1A) } } else if is_hot(Act::Mic(n as u8)) { th().card_hot } else { th().card };
         p.fill(&r, col, 13);
-        p.text(label, &r, if on { TEXT } else { mix(SUB, TEXT, 0.5) }, a.fonts.small, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        p.text(label, &r, if on { rgb(0xFF, 0xFF, 0xFF) } else { mix(th().sub, th().text, 0.5) }, a.fonts.small, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         hit(r, Act::Mic(n as u8));
         cx += tw + 6;
     }
@@ -1776,16 +2089,25 @@ fn paint_pad_extras(p: &Painter, x: i32, y: i32, w: i32, switch: bool) {
 
 fn paint_slider(p: &Painter, label: &str, value: u8, x: i32, y: i32, w: i32, id: u8, enabled: bool) {
     let a = app();
-    let col = if enabled { SUB } else { LINE };
+    let col = if enabled { th().sub } else { th().line };
     p.text(&label.to_uppercase(), &p.rect(x, y, 200, 18), col, a.fonts.small, DT_SINGLELINE);
     p.text(&format!("{value} %"), &p.rect(x + w - 80, y, 80, 18), col, a.fonts.small, DT_SINGLELINE | DT_RIGHT);
     let ty = y + 30;
-    p.fill(&p.rect(x, ty, w, 6), LINE, 3);
+    p.fill(&p.rect(x, ty, w, 6), th().line, 3);
     if enabled {
         let fw = (w * value as i32 / 100).max(6);
-        p.fill(&p.rect(x, ty, fw, 6), ACCENT, 3);
+        p.fill(&p.rect(x, ty, fw, 6), th().accent, 3);
         let kx = x + fw - 9;
-        p.circle(&p.rect(kx, ty - 6, 18, 18), TEXT, if is_hot(Act::Slider(id)) { Some((ACCENT, 3)) } else { None });
+        let knob = if th().light { rgb(0xFF, 0xFF, 0xFF) } else { th().text };
+        let border = if is_hot(Act::Slider(id)) { Some((th().accent, 3)) } else if th().light { Some((th().line, 1)) } else { None };
+        if th().square {
+            p.fill(&p.rect(kx + 3, ty - 6, 12, 18), knob, 2);
+            if let Some((c, w)) = border {
+                p.stroke(&p.rect(kx + 3, ty - 6, 12, 18), c, 2, w);
+            }
+        } else {
+            p.circle(&p.rect(kx, ty - 6, 18, 18), knob, border);
+        }
         hit(p.rect(x - 8, ty - 12, w + 16, 30), Act::Slider(id));
     }
 }
@@ -1973,11 +2295,11 @@ fn paint_keyboard(p: &Painter, x: i32, y: i32, w: i32) -> i32 {
         for g in 0..3 {
             let grow = 3 + g * 3;
             let fr = RECT { left: frame.left - s(grow), top: frame.top - s(grow), right: frame.right + s(grow), bottom: frame.bottom + s(grow) };
-            p.stroke(&fr, mix(BG, to_ref(glow_c), (0.3 - g as f32 * 0.09) * rb * glow_k), 22 + grow, 2);
+            p.stroke(&fr, mix(th().bg, to_ref(glow_c), (0.3 - g as f32 * 0.09) * rb * glow_k), 22 + grow, 2);
         }
     }
     p.fill(&frame, rgb(0x16, 0x16, 0x1D), 18);
-    p.stroke(&frame, LINE, 18, 1);
+    p.stroke(&frame, th().line, 18, 1);
     if a.rim.mode != 25 {
         let inset = s(3);
         let (l, t, r, b) = (frame.left + inset, frame.top + inset, frame.right - inset, frame.bottom - inset);
@@ -2030,9 +2352,9 @@ fn paint_keyboard(p: &Painter, x: i32, y: i32, w: i32) -> i32 {
         let lit = kk > 0.15;
         p.fill(&r, mix(KEYCAP, col, 0.32), 4);
         let hot = a.tab == 0 && is_hot(Act::Key(idx));
-        p.stroke(&r, if hot { TEXT } else { mix(LINE, col, kk.max(0.2)) }, 4, if hot { 2 } else { 1 });
+        p.stroke(&r, if hot { KB_TEXT } else { mix(KB_LINE, col, kk.max(0.2)) }, 4, if hot { 2 } else { 1 });
         let font = if label.contains('\n') || label.chars().count() > 4 || small_labels { a.fonts.key_small } else { a.fonts.key };
-        p.text_center(label, &r, if lit { mix(TEXT, col, 0.25) } else { SUB }, font);
+        p.text_center(label, &r, if lit { mix(KB_TEXT, col, 0.25) } else { KB_SUB }, font);
         if a.tab == 0 {
             hit(r, Act::Key(idx));
         }
@@ -2045,7 +2367,7 @@ fn paint_device_hero(p: &Painter, d: &Device, x: i32, y: i32, w: i32) -> i32 {
     let e = *editing();
     let cycle = a.zones.is_empty() && e.mode == MODE_CYCLE && a.cycle.len() >= 2;
     let col = if e.mode == MODE_OFF {
-        LINE
+        th().line
     } else if a.zones.is_empty() && is_app_animated(e.mode) {
         to_ref(anim_color(&e, &a.cycle, anim_time()))
     } else if e.multi || matches!(e.mode, 0x03 | 0x0E) && !a.zones.is_empty() {
@@ -2063,7 +2385,7 @@ fn paint_device_hero(p: &Painter, d: &Device, x: i32, y: i32, w: i32) -> i32 {
             let f = t.fract();
             let f = f * f * (3.0 - 2.0 * f);
             let c = mix(to_ref(a.cycle[i]), to_ref(a.cycle[(i + 1) % n]), f);
-            p.fill(&p.rect(bx + px, y + 74, 1, 26), mix(BG, c, 0.2 + 0.8 * e.bright as f32 / 100.0), 0);
+            p.fill(&p.rect(bx + px, y + 74, 1, 26), mix(th().bg, c, 0.2 + 0.8 * e.bright as f32 / 100.0), 0);
         }
         section(p, "VISTA PREVIA DEL CICLO", bx, y + 50);
     }
@@ -2073,22 +2395,23 @@ fn paint_device_hero(p: &Painter, d: &Device, x: i32, y: i32, w: i32) -> i32 {
     let bright = e.bright as f32 / 100.0;
     for g in (0..4).rev() {
         let grow = g * 9;
-        p.circle(&p.rect(cx - grow, y - grow + 14, size + grow * 2, size + grow * 2), mix(BG, col, (0.12 + (3 - g) as f32 * 0.07) * bright), None);
+        p.circle(&p.rect(cx - grow, y - grow + 14, size + grow * 2, size + grow * 2), mix(th().bg, col, (0.12 + (3 - g) as f32 * 0.07) * bright), None);
     }
-    p.circle(&p.rect(cx + 10, y + 24, size - 20, size - 20), CARD, Some((mix(BG, col, 0.3 + 0.7 * bright), 4)));
-    p.text(glyph(d), &p.rect(cx, y + 14, size, size), TEXT, a.fonts.icon_big, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    p.circle(&p.rect(cx + 10, y + 24, size - 20, size - 20), th().card, Some((mix(th().bg, col, 0.3 + 0.7 * bright), 4)));
+    p.text(glyph(d), &p.rect(cx, y + 14, size, size), th().text, a.fonts.icon_big, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     y + size + 30
 }
 
 fn paint_battery_only(p: &Painter, d: &Device, x: i32, w: i32) {
     let a = app();
     let card = p.rect(x, 104, w, 176);
-    p.fill(&card, CARD, 16);
-    p.text(glyph(d), &p.rect(x + 30, 122, 80, 80), TEXT, a.fonts.icon_big, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    p.fill(&card, th().card, 16);
+    p.stroke(&card, th().border, 16, 1);
+    p.text(glyph(d), &p.rect(x + 30, 122, 80, 80), th().text, a.fonts.icon_big, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     match d.battery {
         Some(b) => {
             let txt = if b.approx { format!("≈ {} %", b.pct) } else { format!("{} %", b.pct) };
-            p.text(&txt, &p.rect(x + 140, 122, 300, 56), TEXT, a.fonts.title, DT_SINGLELINE | DT_VCENTER);
+            p.text(&txt, &p.rect(x + 140, 122, 300, 56), th().text, a.fonts.title, DT_SINGLELINE | DT_VCENTER);
             let mut state = (if b.charging { "Cargando" } else if b.approx { "Nivel aproximado" } else { "Batería" }).to_string();
             match history::estimate(d) {
                 Some((true, secs)) => state += &format!(" · se llenará en ≈ {}", history::fmt_dur(secs)),
@@ -2096,15 +2419,15 @@ fn paint_battery_only(p: &Painter, d: &Device, x: i32, w: i32) {
                 None if !b.approx => state += " · la estimación aparece tras un rato de uso",
                 None => {}
             }
-            p.text(&state, &p.rect(x + 140, 178, w - 170, 22), SUB, a.fonts.body, DT_SINGLELINE | DT_END_ELLIPSIS);
+            p.text(&state, &p.rect(x + 140, 178, w - 170, 22), th().sub, a.fonts.body, DT_SINGLELINE | DT_END_ELLIPSIS);
             let bw = w - 170;
-            p.fill(&p.rect(x + 140, 226, bw, 14), LINE, 7);
+            p.fill(&p.rect(x + 140, 226, bw, 14), th().line, 7);
             p.fill(&p.rect(x + 140, 226, (bw * b.pct as i32 / 100).max(14), 14), battery_color(b.pct), 7);
         }
         None => {
-            p.text(&battery_text(d), &p.rect(x + 140, 134, w - 170, 40), TEXT, a.fonts.h2, DT_SINGLELINE | DT_VCENTER);
+            p.text(&battery_text(d), &p.rect(x + 140, 134, w - 170, 40), th().text, a.fonts.h2, DT_SINGLELINE | DT_VCENTER);
             if d.led.is_none() {
-                p.text("Este dispositivo no tiene luces configurables.", &p.rect(x + 140, 180, w - 170, 22), SUB, a.fonts.body, DT_SINGLELINE);
+                p.text("Este dispositivo no tiene luces configurables.", &p.rect(x + 140, 180, w - 170, 22), th().sub, a.fonts.body, DT_SINGLELINE);
             }
         }
     }
@@ -2117,21 +2440,23 @@ fn paint_battery_only(p: &Painter, d: &Device, x: i32, w: i32) {
             cx -= tw;
             let r = p.rect(cx, 294, tw, 26);
             let on = a.hist_days == days as u64;
-            p.fill(&r, if on { ACCENT } else if is_hot(Act::HistRange(days)) { CARD_HOT } else { CARD }, 13);
-            p.text(label, &r, TEXT, a.fonts.small, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            p.fill(&r, if on { th().accent } else if is_hot(Act::HistRange(days)) { th().card_hot } else { th().card }, 13);
+            p.text(label, &r, if on { th().on_accent } else { th().text }, a.fonts.small, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             hit(r, Act::HistRange(days));
             cx -= 6;
         }
-        p.fill(&p.rect(x, 326, w, WIN_H - 80 - 326), CARD, 16);
+        let gr = p.rect(x, 326, w, WIN_H - 80 - 326);
+        p.fill(&gr, th().card, 16);
+        p.stroke(&gr, th().border, 16, 1);
         history::paint_graph(p, &d.key, x + 16, 372, w - 40, WIN_H - 80 - 372 - 44, a.hist_days);
     } else if d.kind == "Placa base" {
         let hint = "Para controlar sus luces (y las de RAM, gráfica, ventiladores…), instala OpenRGB, \
                     actívale el servidor SDK (pestaña SDK Server › Start Server) y déjalo abierto: \
                     sus dispositivos aparecerán aquí en la lista.";
-        p.text(hint, &p.rect(x + 30, 310, w - 60, 80), SUB, a.fonts.body, DT_WORDBREAK);
+        p.text(hint, &p.rect(x + 30, 310, w - 60, 80), th().sub, a.fonts.body, DT_WORDBREAK);
     }
     if !a.status.is_empty() {
-        p.text(&a.status, &p.rect(x, WIN_H - 64, w, 40), SUB, a.fonts.small, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        p.text(&a.status, &p.rect(x, WIN_H - 64, w, 40), th().sub, a.fonts.small, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
     }
 }
 
@@ -2184,6 +2509,21 @@ fn on_click(act: Act, x: i32) {
         Act::Settings => {
             a.page = 2;
             redraw();
+        }
+        Act::Theme(i) => {
+            a.config.theme = i;
+            save_config(&a.config);
+            apply_theme();
+        }
+        Act::Accent(i) => {
+            a.config.accent = i;
+            save_config(&a.config);
+            apply_theme();
+        }
+        Act::Corners(sq) => {
+            a.config.square = sq;
+            save_config(&a.config);
+            apply_theme();
         }
         Act::Widget => {
             a.config.hide_widget = !a.config.hide_widget;
@@ -2984,7 +3324,7 @@ unsafe fn make_icon(size: i32) -> HICON {
     let kb = CreateSolidBrush(KEY);
     FillRect(dc, &all, kb);
     DeleteObject(kb);
-    let br = CreateSolidBrush(ACCENT);
+    let br = CreateSolidBrush(th().accent);
     let ob = SelectObject(dc, br);
     let op = SelectObject(dc, GetStockObject(NULL_PEN));
     RoundRect(dc, 0, 0, size + 1, size + 1, size / 2, size / 2);
@@ -3160,7 +3500,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 SetBkMode(mem, TRANSPARENT as i32);
                 SetViewportOrgEx(mem, -pr.left, -pr.top, null_mut());
                 let painter = Painter { dc: mem };
-                painter.fill(&pr, BG, 0);
+                painter.fill(&pr, th().bg, 0);
                 a.partial = true;
                 if kb {
                     paint_keyboard(&painter, px, py, pw);
@@ -3355,6 +3695,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_HOTKEY => {
             state::on_hotkey(wp as i32);
             0
+        }
+        WM_SETTINGCHANGE | 0x0320 => {
+            // Cambió el modo claro/oscuro o el color de Windows (0x0320 = WM_DWMCOLORIZATIONCOLORCHANGED)
+            if a.config.theme == THEME_SYSTEM || a.config.accent == ACCENT_WINDOWS {
+                apply_theme();
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_KEYDOWN | WM_SYSKEYDOWN if a.recording.is_some() => {
             state::record_key(wp as u32);
@@ -3630,6 +3977,14 @@ unsafe fn do_render(args: &[String]) {
         return;
     }
     let key = args.get(2).cloned().unwrap_or_default();
+    // --tema <tema> <acento> <0|1 rectas>: probar un aspecto sin cambiar la configuración
+    if let Some(i) = args.iter().position(|x| x == "--tema") {
+        let n = |k: usize| args.get(i + k).and_then(|v| v.parse::<u8>().ok()).unwrap_or(0);
+        a.config.theme = n(1);
+        a.config.accent = n(2);
+        a.config.square = n(3) == 1;
+        THEME = make_theme(a.config.theme, a.config.accent, a.config.square);
+    }
     a.devices = devices::scan();
     state::seed_profiles_mem(); // sólo en memoria: las capturas no tocan la configuración
     if let Some(h) = args.iter().position(|x| x == "--hist").and_then(|i| args.get(i + 1)) {
@@ -3872,6 +4227,7 @@ fn main() {
             first_scan: true,
         });
         APP = Box::into_raw(app_box);
+        THEME = make_theme(app().config.theme, app().config.accent, app().config.square);
 
         let style = WIN_STYLE;
         let mut rc = RECT { left: 0, top: 0, right: s(WIN_W), bottom: s(WIN_H) };
@@ -3924,9 +4280,9 @@ fn main() {
                 set_autostart(true);
             }
         }
-        // Barra de título oscura (Windows 11)
-        let dark: i32 = 1;
-        DwmSetWindowAttribute(hwnd, 20, &dark as *const i32 as _, 4);
+        // Barra de título y menús con los colores del tema
+        style_window(hwnd);
+        menu_mode(th().light);
         if !update_tray(true) {
             // Con el inicio rápido la barra de tareas puede no existir todavía.
             SetTimer(hwnd, TIMER_TRAY, 2000, None);
