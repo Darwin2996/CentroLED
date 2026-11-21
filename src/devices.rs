@@ -87,6 +87,7 @@ pub enum Driver {
     Logitech { path: Vec<u16>, idx: u8, led_feat: u8, zones: Vec<LogiZone> },
     Switch { path: Vec<u16>, out_len: u16, home: bool },
     OpenRgb { index: u32, leds: u16 },
+    LampArray { path: Vec<u16> },
     None,
 }
 
@@ -197,6 +198,8 @@ pub fn scan() -> Vec<Device> {
     // Cascos de otras marcas y mandos de Nintendo
     out.extend(crate::headsets::scan(&all, &mut handled));
     out.extend(crate::nintendo::scan(&all, &mut handled));
+    // Estándares: Dynamic Lighting (LampArray), Razer y batería HID genérica
+    out.extend(crate::generic::scan(&all, &mut handled));
 
     // Mandos Xbox (XInput) y dispositivos Bluetooth. Si un mando Xbox también publica su
     // batería por Bluetooth (valor exacto), se usa esa y no se muestra dos veces.
@@ -320,6 +323,7 @@ pub fn apply(dev: &Device, s: &LedSetting, extra: Option<&Extra>) -> Result<(), 
             _ => Ok(()),
         },
         Driver::OpenRgb { index, leds } => crate::openrgb::set_color(*index, *leds, scaled(s)),
+        Driver::LampArray { path } => crate::generic::lamparray_apply(path, scaled(s)),
         Driver::None => Err("Este dispositivo no tiene luces controlables".into()),
     }
 }

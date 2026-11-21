@@ -17,6 +17,9 @@ App nativa de Windows (Rust + Win32, ~310 KB) para controlar las luces y ver la 
 | Cascos HyperX Cloud Alpha Wireless, Cloud Flight y Cloud II Wireless | Sí | — |
 | Cascos Corsair Void (y variantes) | Sí | — |
 | Cualquier dispositivo Bluetooth que informe batería a Windows (cascos, ratones, teclados, mandos, relojes…) | Sí | — |
+| Cualquier dispositivo con luces **Dynamic Lighting** de Windows 11 (estándar HID LampArray: Razer, Logitech, ASUS, Corsair, Microsoft…) | — | Color fijo o apagado, sin programas extra |
+| Ratones, teclados y cascos **Razer** | Sí (protocolo Razer) | Con Dynamic Lighting u OpenRGB |
+| Cualquier dispositivo que publique su batería con el estándar HID (*Battery Strength*) | Sí | — |
 | **Todo lo que soporta [OpenRGB](https://openrgb.org)**: placas base, RAM, gráficas, ventiladores, tiras LED, Razer, Corsair… | — | Color fijo o apagado (OpenRGB abierto con su *SDK Server* activado) |
 
 Las luces de mandos y cascos se pierden al desconectarlos; la app las vuelve a aplicar sola (o reanuda el ciclo) cuando se reconectan.
@@ -26,6 +29,8 @@ Las luces de mandos y cascos se pierden al desconectarlos; la app las vuelve a a
 - Ejecuta `CentroLED.exe`. Al cerrar la ventana sigue en segundo plano en la bandeja del sistema. Clic derecho en el icono → Salir.
 - **Teclado**: pestaña **Teclas** para el efecto o para pintar teclas (clic o arrastrar; clic derecho copia el color de una tecla); pestaña **Borde** para el efecto y color de la tira de luz. La vista previa se anima con el efecto elegido (es aproximada). Pulsa **Aplicar** para guardarlo en el teclado.
 - **Mando**: elige "Ciclo suave", añade colores desde la paleta (clic en un color de la lista para quitarlo) y ajusta brillo y velocidad.
+- **Inicio**: un resumen con una tarjeta por dispositivo (batería, estado y color de sus luces). **Ajustes**: todas las opciones en una página.
+- **Batería en todas las pantallas**: Windows sólo pone iconos junto al reloj en la pantalla principal, así que en las demás Centro LED coloca un pequeño widget sobre la barra de tareas, junto a su reloj. Clic = abrir Centro LED, clic derecho = menú, arrastrar = moverlo. Se oculta solo con juegos o vídeos a pantalla completa en esa pantalla.
 - **Batería en la barra de tareas**: cada dispositivo con batería tiene su icono junto al reloj: el dibujo del tipo de dispositivo (mando, cascos, ratón, teclado…) sobre una pila con el porcentaje (verde/ámbar/rojo, contorno amarillo al cargar, gris si es el último valor conocido). Se adapta al tema claro u oscuro de la barra. Se activa o desactiva en la barra lateral. Windows 11 coloca los iconos nuevos tras la flecha **^**: la app los marca para mostrarse y Windows lo aplica al reiniciar la sesión; o arrástralos una vez de la flecha a la barra.
 - **Aviso de batería baja**: notificación de Windows al bajar del 15 % sin cargar (requiere tener las notificaciones de Windows activadas).
 - "Iniciar con Windows" la arranca minimizada en la bandeja (si mueves el `.exe`, la entrada se corrige sola al abrirlo).

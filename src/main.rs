@@ -3,6 +3,7 @@
 //! La interfaz se dibuja a mano con GDI (sin controles estándar ni motores web).
 
 mod devices;
+mod generic;
 mod headsets;
 mod nintendo;
 mod openrgb;
@@ -24,6 +25,7 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Registry::*;
 use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, SetProcessWorkingSetSize};
 use windows_sys::Win32::UI::Controls::Dialogs::*;
+use windows_sys::Win32::UI::Controls::TTTOOLINFOW;
 use windows_sys::Win32::UI::HiDpi::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows_sys::Win32::UI::Shell::*;
@@ -43,6 +45,7 @@ const TIMER_DEVCHANGE: usize = 2;
 const TIMER_ANIM: usize = 3;
 const TIMER_PROMOTE: usize = 4;
 const TIMER_UPDATE: usize = 5;
+const TIMER_WIDGET: usize = 6;
 const WM_UPD_INFO: u32 = WM_APP + 4;
 const WM_UPD_DONE: u32 = WM_APP + 5;
 /// Petición de cierre real (la usa el desinstalador).
@@ -145,6 +148,11 @@ enum Act {
     Autostart,
     TrayBattery,
     Update,
+    Home,
+    Settings,
+    Widget,
+    LowBattery(u8),
+    OpenUrl,
 }
 
 struct Fonts {
@@ -157,6 +165,7 @@ struct Fonts {
     key_small: HFONT,
     icon: HFONT,
     icon_big: HFONT,
+    small_icon: HFONT,
 }
 
 #[derive(Default)]
@@ -165,6 +174,12 @@ struct Config {
     keys: HashMap<String, Box<[[u8; 3]; KB_LEDS]>>,
     cycles: HashMap<String, Vec<[u8; 3]>>,
     hide_tray_battery: bool,
+    /// No mostrar el widget de batería en las barras de tareas secundarias.
+    hide_widget: bool,
+    /// Distancia del widget al borde derecho de la barra (px lógicos).
+    widget_offset: i32,
+    /// Umbral del aviso de batería baja (0 = desactivado).
+    low_battery: u8,
     pads: HashMap<String, PadExtra>,
 }
 
@@ -222,6 +237,23 @@ struct App {
     next_tray_id: u32,
     upd: Upd,
     mutex: HANDLE,
+    /// 0 = inicio (resumen), 1 = dispositivo, 2 = ajustes
+    page: u8,
+    list_scroll: i32,
+    list_max: i32,
+    home_scroll: i32,
+    home_max: i32,
+    widgets: Vec<Widget>,
+    widget_drag: Option<(i32, i32, bool)>,
+}
+
+/// Widget de batería colocado sobre la barra de tareas de una pantalla secundaria.
+struct Widget {
+    hwnd: HWND,
+    taskbar: HWND,
+    tip: HWND,
+    sig: String,
+    dpi: u32,
 }
 
 /// Estado del actualizador.
@@ -276,7 +308,7 @@ fn parse_rgb(h: &str) -> Option<[u8; 3]> {
 }
 
 fn load_config() -> Config {
-    let mut cfg = Config::default();
+    let mut cfg = Config { widget_offset: 110, low_battery: 15, ..Config::default() };
     let Ok(text) = std::fs::read_to_string(config_path()) else { return cfg };
     for line in text.lines() {
         let f: Vec<&str> = line.split('\t').collect();
@@ -289,8 +321,14 @@ fn load_config() -> Config {
         } else if f.len() == 5 && f[0] == "#pad" {
             let n = |s: &str| s.parse::<u8>().unwrap_or(0);
             cfg.pads.insert(f[1].to_string(), PadExtra { player: n(f[2]), player_bright: n(f[3]), mic: n(f[4]) });
-        } else if f.len() == 3 && f[0] == "#opt" && f[1] == "hide_tray_battery" {
-            cfg.hide_tray_battery = f[2] == "1";
+        } else if f.len() == 3 && f[0] == "#opt" {
+            match f[1] {
+                "hide_tray_battery" => cfg.hide_tray_battery = f[2] == "1",
+                "hide_widget" => cfg.hide_widget = f[2] == "1",
+                "widget_offset" => cfg.widget_offset = f[2].parse().unwrap_or(110),
+                "low_battery" => cfg.low_battery = f[2].parse().unwrap_or(15),
+                _ => {}
+            }
         } else if f.len() == 3 && f[0] == "#cycle" {
             let list: Vec<[u8; 3]> = (0..f[2].len() / 6).filter_map(|i| parse_rgb(&f[2][i * 6..i * 6 + 6])).collect();
             if list.len() >= 2 {
@@ -325,6 +363,9 @@ fn save_config(cfg: &Config) {
         text += &format!("#pad\t{}\t{}\t{}\t{}\n", k, x.player, x.player_bright, x.mic);
     }
     text += &format!("#opt\thide_tray_battery\t{}\n", cfg.hide_tray_battery as u8);
+    text += &format!("#opt\thide_widget\t{}\n", cfg.hide_widget as u8);
+    text += &format!("#opt\twidget_offset\t{}\n", cfg.widget_offset);
+    text += &format!("#opt\tlow_battery\t{}\n", cfg.low_battery);
     let _ = std::fs::write(path, text);
 }
 
@@ -824,12 +865,31 @@ fn paint(p: &Painter) {
     paint_sidebar(p);
     let content_x = SIDEBAR_W + 28;
     let content_w = WIN_W - content_x - 28;
-    match selected() {
-        None => {
-            let r = p.rect(content_x, 0, content_w, WIN_H);
-            p.text("Selecciona un dispositivo a la izquierda", &r, SUB, a.fonts.h2, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        }
-        Some(d) => paint_device(p, &d, content_x, content_w),
+    match (a.page, selected()) {
+        (1, Some(d)) => paint_device(p, &d, content_x, content_w),
+        (2, _) => paint_settings(p, content_x, content_w),
+        _ => paint_home(p, content_x, content_w),
+    }
+}
+
+/// Elemento de navegación de la barra lateral (Inicio / Ajustes).
+fn nav_item(p: &Painter, y: i32, glyph_s: &str, label: &str, active: bool, act: Act) {
+    let a = app();
+    let r = p.rect(14, y, SIDEBAR_W - 28, 40);
+    p.fill(&r, if active || is_hot(act) { CARD_HOT } else { SIDEBAR }, 10);
+    if active {
+        p.fill(&p.rect(14, y + 10, 4, 20), ACCENT, 2);
+    }
+    p.text(glyph_s, &p.rect(30, y, 30, 40), if active { ACCENT_HOT } else { SUB }, a.fonts.icon, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    p.text(label, &p.rect(70, y, 180, 40), TEXT, a.fonts.bold, DT_SINGLELINE | DT_VCENTER);
+    hit(r, act);
+}
+
+/// Registra una zona de clic recortada al área visible de una lista con desplazamiento.
+fn hit_clipped(r: RECT, view: &RECT, act: Act) {
+    let c = RECT { left: r.left.max(view.left), top: r.top.max(view.top), right: r.right.min(view.right), bottom: r.bottom.min(view.bottom) };
+    if c.bottom > c.top {
+        hit(c, act);
     }
 }
 
@@ -842,13 +902,36 @@ fn paint_sidebar(p: &Painter) {
     p.text("Centro LED", &p.rect(70, 22, 200, 24), TEXT, a.fonts.h2, DT_SINGLELINE);
     paint_update(p);
 
-    let mut y = 86;
+    nav_item(p, 80, "\u{E80F}", "Inicio", a.page == 0, Act::Home);
+
+    // Cabecera de la lista con el botón de buscar
+    section(p, &format!("DISPOSITIVOS · {}", a.devices.len()), 28, 136);
+    let sr = p.rect(SIDEBAR_W - 52, 128, 30, 30);
+    if is_hot(Act::Scan) {
+        p.fill(&sr, CARD_HOT, 8);
+    }
+    p.text(if a.scanning { "\u{E895}" } else { "\u{E72C}" }, &sr, if a.scanning { ACCENT_HOT } else { SUB }, a.fonts.small_icon, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    hit(sr, Act::Scan);
+
+    // Lista con desplazamiento
+    let view_top = 164;
+    let view_bottom = WIN_H - 72;
+    let view = p.rect(0, view_top, SIDEBAR_W, view_bottom - view_top);
+    let total = a.devices.len() as i32 * 66;
+    a.list_max = (total - (view_bottom - view_top)).max(0);
+    a.list_scroll = a.list_scroll.clamp(0, a.list_max);
+    unsafe {
+        SaveDC(p.dc);
+        IntersectClipRect(p.dc, view.left, view.top, view.right, view.bottom);
+    }
+    let mut y = view_top - a.list_scroll;
     for (i, d) in a.devices.iter().enumerate() {
-        if y + 66 > WIN_H - 160 {
-            break;
+        if y + 62 < view_top || y > view_bottom {
+            y += 66;
+            continue;
         }
         let r = p.rect(14, y, SIDEBAR_W - 28, 62);
-        let selected = a.sel.as_deref() == Some(&d.key);
+        let selected = a.page == 1 && a.sel.as_deref() == Some(&d.key);
         let hot = is_hot(Act::Device(i));
         p.fill(&r, if selected || hot { CARD_HOT } else { SIDEBAR }, 10);
         if selected {
@@ -860,10 +943,8 @@ fn paint_sidebar(p: &Painter) {
         p.text(&d.name, &p.rect(80, y + 10, SIDEBAR_W - 28 - 76, 20), TEXT, a.fonts.bold, DT_SINGLELINE | DT_END_ELLIPSIS);
         match d.battery {
             Some(b) => {
-                let track = p.rect(80, y + 39, 96, 6);
-                p.fill(&track, LINE, 3);
-                let fill_w = (96 * b.pct as i32 / 100).max(4);
-                p.fill(&p.rect(80, y + 39, fill_w, 6), battery_color(b.pct), 3);
+                p.fill(&p.rect(80, y + 39, 96, 6), LINE, 3);
+                p.fill(&p.rect(80, y + 39, (96 * b.pct as i32 / 100).max(4), 6), battery_color(b.pct), 3);
                 let label = if b.charging { format!("{} % ⚡", b.pct) } else if b.approx { format!("≈{} %", b.pct) } else { format!("{} %", b.pct) };
                 p.text(&label, &p.rect(184, y + 32, 70, 20), SUB, a.fonts.small, DT_SINGLELINE | DT_VCENTER);
             }
@@ -878,24 +959,197 @@ fn paint_sidebar(p: &Painter) {
                 p.text(&format!("{} · {}", d.kind, note), &p.rect(80, y + 32, SIDEBAR_W - 28 - 76, 20), SUB, a.fonts.small, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
             }
         }
-        hit(r, Act::Device(i));
-        y += 68;
+        hit_clipped(r, &view, Act::Device(i));
+        y += 66;
     }
     if a.devices.is_empty() {
         let msg = if a.scanning { "Buscando…" } else { "No se encontraron dispositivos" };
-        p.text(msg, &p.rect(28, y, SIDEBAR_W - 56, 24), SUB, a.fonts.body, DT_SINGLELINE);
+        p.text(msg, &p.rect(28, view_top + 8, SIDEBAR_W - 56, 24), SUB, a.fonts.body, DT_SINGLELINE);
+    }
+    unsafe {
+        RestoreDC(p.dc, -1);
+    }
+    // Sombra suave cuando hay más elementos debajo / encima
+    if a.list_scroll < a.list_max {
+        p.fill(&p.rect(14, view_bottom - 2, SIDEBAR_W - 28, 2), LINE, 1);
+    }
+    if a.list_scroll > 0 {
+        p.fill(&p.rect(14, view_top, SIDEBAR_W - 28, 2), LINE, 1);
     }
 
-    // Botón de búsqueda e inicio con Windows
-    let br = p.rect(18, WIN_H - 150, SIDEBAR_W - 36, 40);
-    p.fill(&br, if is_hot(Act::Scan) { CARD_HOT } else { CARD }, 10);
-    let label = if a.scanning { "Buscando…" } else { "Buscar dispositivos" };
-    p.text(label, &br, TEXT, a.fonts.body, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    hit(br, Act::Scan);
-    paint_switch(p, 22, WIN_H - 92, !a.config.hide_tray_battery, Act::TrayBattery);
-    p.text("Batería en la barra de tareas", &p.rect(70, WIN_H - 95, 210, 24), SUB, a.fonts.body, DT_SINGLELINE | DT_VCENTER);
-    paint_switch(p, 22, WIN_H - 52, a.autostart, Act::Autostart);
-    p.text("Iniciar con Windows", &p.rect(70, WIN_H - 55, 200, 24), SUB, a.fonts.body, DT_SINGLELINE | DT_VCENTER);
+    nav_item(p, WIN_H - 60, "\u{E713}", "Ajustes", a.page == 2, Act::Settings);
+}
+
+/// Página de inicio: una tarjeta por dispositivo con su batería y estado de luces.
+fn paint_home(p: &Painter, x: i32, w: i32) {
+    let a = app();
+    p.text("Resumen", &p.rect(x, 22, w, 34), TEXT, a.fonts.title, DT_SINGLELINE);
+    let with_bat = a.devices.iter().filter(|d| d.battery.is_some()).count();
+    let sub = if a.status.is_empty() {
+        format!("{} dispositivos · {} con batería", a.devices.len(), with_bat)
+    } else {
+        a.status.clone()
+    };
+    p.text(&sub, &p.rect(x, 58, w, 20), SUB, a.fonts.body, DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    let cols = 3;
+    let gap = 16;
+    let cw = (w - gap * (cols - 1)) / cols;
+    let ch = 140;
+    let view_top = 100;
+    let view_bottom = WIN_H - 16;
+    let view = p.rect(x - 8, view_top, w + 16, view_bottom - view_top);
+    let rows = (a.devices.len() as i32 + cols - 1) / cols;
+    a.home_max = (rows * (ch + gap) - (view_bottom - view_top)).max(0);
+    a.home_scroll = a.home_scroll.clamp(0, a.home_max);
+    if a.devices.is_empty() {
+        let msg = if a.scanning { "Buscando dispositivos…" } else { "No se encontraron dispositivos. Conecta alguno y pulsa el botón de buscar." };
+        p.text(msg, &p.rect(x, 140, w, 30), SUB, a.fonts.h2, DT_SINGLELINE);
+        return;
+    }
+    unsafe {
+        SaveDC(p.dc);
+        IntersectClipRect(p.dc, view.left, view.top, view.right, view.bottom);
+    }
+    for (i, d) in a.devices.iter().enumerate() {
+        let (col, row) = (i as i32 % cols, i as i32 / cols);
+        let cx = x + col * (cw + gap);
+        let cy = view_top + row * (ch + gap) - a.home_scroll;
+        if cy + ch < view_top || cy > view_bottom {
+            continue;
+        }
+        let r = p.rect(cx, cy, cw, ch);
+        let hot = is_hot(Act::Device(i));
+        p.fill(&r, if hot { CARD_HOT } else { CARD }, 14);
+        // Icono con el color de sus luces (si las tiene y están guardadas)
+        let led_col = a.config.led.get(&d.key).filter(|s| s.mode != MODE_OFF).map(|s| rgb(s.rgb.0, s.rgb.1, s.rgb.2));
+        let ic = p.rect(cx + 16, cy + 16, 44, 44);
+        p.fill(&ic, led_col.map(|c| mix(BG, c, 0.55)).unwrap_or(LINE), 12);
+        p.text(glyph(d), &ic, TEXT, a.fonts.icon, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        p.text(&d.name, &p.rect(cx + 72, cy + 16, cw - 88, 22), TEXT, a.fonts.bold, DT_SINGLELINE | DT_END_ELLIPSIS);
+        p.text(&format!("{} · {}", d.kind, d.conn), &p.rect(cx + 72, cy + 38, cw - 88, 20), SUB, a.fonts.small, DT_SINGLELINE | DT_END_ELLIPSIS);
+        // Batería o estado
+        let by = cy + 78;
+        let bat = d.battery.map(|b| (b.pct, b.charging, false)).or_else(|| last_battery(d).map(|p| (p, false, true)));
+        match bat {
+            Some((pct, charging, stale)) => {
+                let col = if stale { mix(LINE, battery_color(pct), 0.45) } else { battery_color(pct) };
+                p.text(&format!("{} %", pct), &p.rect(cx + 16, by, 120, 30), TEXT, a.fonts.h2, DT_SINGLELINE | DT_VCENTER);
+                let note = if charging { "cargando ⚡" } else if stale { "último valor · dormido" } else { "batería" };
+                p.text(note, &p.rect(cx + 100, by, cw - 116, 30), SUB, a.fonts.small, DT_SINGLELINE | DT_VCENTER | DT_RIGHT);
+                p.fill(&p.rect(cx + 16, by + 36, cw - 32, 8), LINE, 4);
+                p.fill(&p.rect(cx + 16, by + 36, ((cw - 32) * pct as i32 / 100).max(8), 8), col, 4);
+            }
+            None => {
+                let note = if d.battery_note.is_empty() || d.battery_note == "—" { "Sin batería" } else { d.battery_note };
+                p.text(note, &p.rect(cx + 16, by, cw - 32, 24), SUB, a.fonts.body, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+            }
+        }
+        if d.led.is_some() {
+            let st = a.config.led.get(&d.key);
+            let label = match st {
+                Some(s) if s.mode == MODE_OFF => "Luces apagadas".to_string(),
+                Some(_) => "Luces configuradas".to_string(),
+                None => "Luces · sin configurar".to_string(),
+            };
+            // Sin batería: la segunda línea muestra el estado de las luces.
+            if bat.is_none() {
+                let ly = by + 30;
+                if let Some(c) = led_col {
+                    p.circle(&p.rect(cx + 16, ly + 5, 10, 10), c, None);
+                }
+                let lx = if led_col.is_some() { cx + 32 } else { cx + 16 };
+                p.text(&label, &p.rect(lx, ly, cw - 48, 20), SUB, a.fonts.small, DT_SINGLELINE | DT_VCENTER);
+            }
+        }
+        hit_clipped(r, &view, Act::Device(i));
+    }
+    unsafe {
+        RestoreDC(p.dc, -1);
+    }
+}
+
+/// Fila de ajuste con interruptor, título y descripción.
+fn setting_row(p: &Painter, x: i32, y: i32, w: i32, title: &str, desc: &str, on: bool, act: Act) -> i32 {
+    let a = app();
+    p.text(title, &p.rect(x + 20, y + 14, w - 110, 22), TEXT, a.fonts.bold, DT_SINGLELINE);
+    let lines = if desc.is_empty() { 0 } else { 2 };
+    if lines > 0 {
+        p.text(desc, &p.rect(x + 20, y + 36, w - 110, 36), SUB, a.fonts.small, DT_WORDBREAK);
+    }
+    paint_switch(p, x + w - 62, y + 18, on, act);
+    y + if lines > 0 { 80 } else { 50 }
+}
+
+fn card(p: &Painter, x: i32, y: i32, w: i32, h: i32, title: &str) {
+    section(p, title, x, y);
+    p.fill(&p.rect(x, y + 22, w, h), CARD, 14);
+}
+
+/// Página de ajustes.
+fn paint_settings(p: &Painter, x: i32, w: i32) {
+    let a = app();
+    p.text("Ajustes", &p.rect(x, 22, w, 34), TEXT, a.fonts.title, DT_SINGLELINE);
+    p.text(if portable_dir().is_some() { "Versión portable · la configuración se guarda junto al programa" } else { "Se guardan al momento" }, &p.rect(x, 58, w, 20), SUB, a.fonts.body, DT_SINGLELINE);
+    let half = (w - 20) / 2;
+    // Columna izquierda
+    let mut y = 96;
+    card(p, x, y, half, 176, "BARRA DE TAREAS");
+    let yy = setting_row(p, x, y + 22, half, "Batería junto al reloj", "Un icono por dispositivo con su tipo y porcentaje.", !a.config.hide_tray_battery, Act::TrayBattery);
+    setting_row(p, x, yy, half, "Batería en las otras pantallas", "Windows sólo los pone junto al reloj en la pantalla principal.", !a.config.hide_widget, Act::Widget);
+    y += 216;
+    card(p, x, y, half, 96, "AVISO DE BATERÍA BAJA");
+    let mut cx = x + 20;
+    for (label, v) in [("No", 0u8), ("10 %", 10), ("15 %", 15), ("20 %", 20), ("30 %", 30)] {
+        let tw = p.measure(label, a.fonts.body) + 26;
+        let r = p.rect(cx, y + 40, tw, 30);
+        let on = a.config.low_battery == v;
+        p.fill(&r, if on { ACCENT } else if is_hot(Act::LowBattery(v)) { CARD_HOT } else { LINE }, 15);
+        p.text(label, &r, TEXT, a.fonts.body, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        hit(r, Act::LowBattery(v));
+        cx += tw + 8;
+    }
+    p.text("Aviso de Windows al bajar de ese nivel sin cargar.", &p.rect(x + 20, y + 80, half - 40, 20), SUB, a.fonts.small, DT_SINGLELINE | DT_END_ELLIPSIS);
+    y += 136;
+    card(p, x, y, half, 50, "GENERAL");
+    setting_row(p, x, y + 22, half, "Iniciar con Windows", "", a.autostart, Act::Autostart);
+
+    // Columna derecha
+    let rx = x + half + 20;
+    let mut y = 96;
+    let orgb = a.devices.iter().filter(|d| d.conn == "OpenRGB").count();
+    card(p, rx, y, half, 176, "OPENRGB · PLACA BASE, RAM, GRÁFICA…");
+    let (status, col) = if orgb > 0 { (format!("● Conectado · {} dispositivo{}", orgb, if orgb == 1 { "" } else { "s" }), GREEN) } else { ("● No detectado".to_string(), SUB) };
+    p.text(&status, &p.rect(rx + 20, y + 36, half - 40, 22), col, a.fonts.bold, DT_SINGLELINE);
+    p.text(
+        "Instala OpenRGB, abre la pestaña SDK Server y pulsa Start Server (puedes hacer que arranque minimizado con el servidor). Sus dispositivos aparecerán aquí.",
+        &p.rect(rx + 20, y + 64, half - 40, 120),
+        SUB,
+        a.fonts.small,
+        DT_WORDBREAK,
+    );
+    y += 216;
+    card(p, rx, y, half, 128, "ACERCA DE");
+    p.text(&format!("Centro LED {}", update::VERSION), &p.rect(rx + 20, y + 36, half - 40, 22), TEXT, a.fonts.bold, DT_SINGLELINE);
+    let state = match &a.upd {
+        Upd::Available(r) => format!("Hay una versión nueva: {}", r.version),
+        Upd::Checking => "Comprobando actualizaciones…".into(),
+        Upd::UpToDate => "Estás al día".into(),
+        Upd::Installing => "Descargando la actualización…".into(),
+        Upd::Error(_) => "No se pudo comprobar (sin conexión)".into(),
+        Upd::Idle => "Se actualiza sola desde GitHub".into(),
+    };
+    p.text(&state, &p.rect(rx + 20, y + 58, half - 40, 20), SUB, a.fonts.small, DT_SINGLELINE);
+    let label = if matches!(a.upd, Upd::Available(_)) { "Actualizar ahora" } else { "Buscar actualizaciones" };
+    let tw = p.measure(label, a.fonts.body) + 32;
+    let b = p.rect(rx + 20, y + 90, tw, 34);
+    p.fill(&b, if is_hot(Act::Update) { ACCENT_HOT } else { ACCENT }, 10);
+    p.text(label, &b, TEXT, a.fonts.body, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    hit(b, Act::Update);
+    let g = p.rect(rx + 30 + tw, y + 90, 130, 34);
+    p.fill(&g, if is_hot(Act::OpenUrl) { CARD_HOT } else { LINE }, 10);
+    p.text("Ver en GitHub", &g, TEXT, a.fonts.body, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    hit(g, Act::OpenUrl);
 }
 
 /// Versión y estado de las actualizaciones, bajo el título.
@@ -1397,6 +1651,9 @@ fn rim_effect(u: f32) -> ([u8; 3], f32) {
 /// ¿Se mueve algo en la vista previa del dispositivo seleccionado?
 fn preview_animates() -> bool {
     let a = app();
+    if a.page != 1 {
+        return false;
+    }
     match selected() {
         Some(d) if is_keyboard(&d) => !matches!(a.cur.mode, 1 | MODE_CUSTOM | MODE_OFF) || !matches!(a.rim.mode, 24 | 25),
         Some(d) => d.led.is_some() && a.zones.is_empty() && is_app_animated(a.cur.mode) && (a.cur.mode != MODE_CYCLE || a.cycle.len() >= 2),
@@ -1596,7 +1853,33 @@ fn paint_key(i: usize) {
 fn on_click(act: Act, x: i32) {
     let a = app();
     match act {
-        Act::Device(i) => select_device(i),
+        Act::Device(i) => {
+            a.page = 1;
+            select_device(i);
+        }
+        Act::Home => {
+            a.page = 0;
+            redraw();
+        }
+        Act::Settings => {
+            a.page = 2;
+            redraw();
+        }
+        Act::Widget => {
+            a.config.hide_widget = !a.config.hide_widget;
+            save_config(&a.config);
+            update_widgets();
+            redraw();
+        }
+        Act::LowBattery(v) => {
+            a.config.low_battery = v;
+            a.low_warned.clear();
+            save_config(&a.config);
+            redraw();
+        }
+        Act::OpenUrl => unsafe {
+            ShellExecuteW(null_mut(), wide("open").as_ptr(), wide(&format!("https://github.com/{}", update::REPO)).as_ptr(), null(), null(), SW_SHOWNORMAL);
+        },
         Act::Tab(t) => {
             a.tab = t;
             redraw();
@@ -1712,9 +1995,10 @@ fn on_scanned(list: Vec<Device>) {
     for d in &list {
         if let Some(b) = d.battery {
             a.last_battery.insert(d.key.clone(), b.pct);
-            if b.charging || b.pct >= 25 {
+            let limit = a.config.low_battery;
+            if b.charging || b.pct >= limit.saturating_add(10) {
                 a.low_warned.remove(&d.key);
-            } else if b.pct <= 15 && !b.approx && a.low_warned.insert(d.key.clone()) {
+            } else if limit > 0 && b.pct <= limit && !b.approx && a.low_warned.insert(d.key.clone()) {
                 notify("Batería baja", &format!("{} está al {} %. Conviene cargarlo.", d.name, b.pct));
             }
         }
@@ -1723,9 +2007,8 @@ fn on_scanned(list: Vec<Device>) {
     let still = a.sel.as_ref().map(|k| a.devices.iter().any(|d| &d.key == k)).unwrap_or(false);
     if !still {
         a.sel = None;
-        // Seleccionar el primer dispositivo con luces para que la ventana no aparezca vacía.
-        if let Some(i) = a.devices.iter().position(|d| d.led.is_some()) {
-            select_device(i);
+        if a.page == 1 {
+            a.page = 0;
         }
     }
     let mut st: SYSTEMTIME = unsafe { std::mem::zeroed() };
@@ -1733,15 +2016,38 @@ fn on_scanned(list: Vec<Device>) {
     set_status(&format!("{} dispositivos · actualizado a las {:02}:{:02}", a.devices.len(), st.wHour, st.wMinute));
     update_tray(false);
     update_battery_icons();
+    update_widgets();
     // Windows crea su ficha del icono un instante después de añadirlo.
     unsafe { SetTimer(a.hwnd, TIMER_PROMOTE, 1500, None) };
 }
 
 // ------------------------------------------------------------------ bandeja del sistema e icono
 
-/// Crea un icono de `size` px. Se dibuja con GDI a 4x (fondo magenta = transparente) y se
-/// reduce promediando, lo que da bordes suaves y transparencia real.
-unsafe fn icon_from(size: i32, draw: impl FnOnce(HDC, i32)) -> HICON {
+unsafe fn pixels_to_icon(size: i32, px: &[u32]) -> HICON {
+    let screen = GetDC(null_mut());
+    let dc = CreateCompatibleDC(screen);
+    let mut bmi: BITMAPINFO = std::mem::zeroed();
+    bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    bmi.bmiHeader.biWidth = size;
+    bmi.bmiHeader.biHeight = -size;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    let mut bits: *mut core::ffi::c_void = null_mut();
+    let color = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+    std::slice::from_raw_parts_mut(bits as *mut u32, px.len()).copy_from_slice(px);
+    let mask = CreateBitmap(size, size, 1, 1, null());
+    let info = ICONINFO { fIcon: 1, xHotspot: 0, yHotspot: 0, hbmMask: mask, hbmColor: color };
+    let icon = CreateIconIndirect(&info);
+    DeleteObject(mask);
+    DeleteObject(color);
+    DeleteDC(dc);
+    ReleaseDC(null_mut(), screen);
+    icon
+}
+
+/// Dibuja con GDI a 4x (fondo magenta = transparente) y reduce promediando: bordes suaves y
+/// transparencia real. Devuelve píxeles ARGB (alfa sin premultiplicar), de arriba abajo.
+unsafe fn render_pixels(size: i32, draw: impl FnOnce(HDC, i32)) -> Vec<u32> {
     const SS: i32 = 4;
     let big = size * SS;
     let screen = GetDC(null_mut());
@@ -1767,9 +2073,7 @@ unsafe fn icon_from(size: i32, draw: impl FnOnce(HDC, i32)) -> HICON {
     GdiFlush();
     SelectObject(dc, old);
     let src = std::slice::from_raw_parts(big_bits as *const u32, (big * big) as usize);
-    let mut bits: *mut core::ffi::c_void = null_mut();
-    let color = dib(size, &mut bits);
-    let dst = std::slice::from_raw_parts_mut(bits as *mut u32, (size * size) as usize);
+    let mut dst = vec![0u32; (size * size) as usize];
     for y in 0..size {
         for x in 0..size {
             let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
@@ -1792,15 +2096,10 @@ unsafe fn icon_from(size: i32, draw: impl FnOnce(HDC, i32)) -> HICON {
             };
         }
     }
-    let mask = CreateBitmap(size, size, 1, 1, null());
-    let info = ICONINFO { fIcon: 1, xHotspot: 0, yHotspot: 0, hbmMask: mask, hbmColor: color };
-    let icon = CreateIconIndirect(&info);
-    DeleteObject(mask);
-    DeleteObject(color);
     DeleteObject(big_bmp);
     DeleteDC(dc);
     ReleaseDC(null_mut(), screen);
-    icon
+    dst
 }
 
 unsafe fn gdi_round(dc: HDC, r: RECT, rad: i32, fill: Option<u32>, pen: Option<(u32, i32)>) {
@@ -1859,8 +2158,12 @@ fn taskbar_light() -> bool {
 }
 
 unsafe fn make_battery_icon(size: i32, pct: u8, charging: bool, stale: bool, glyph: &str) -> HICON {
+    pixels_to_icon(size, &battery_pixels(size, pct, charging, stale, glyph))
+}
+
+unsafe fn battery_pixels(size: i32, pct: u8, charging: bool, stale: bool, glyph: &str) -> Vec<u32> {
     let light = taskbar_light();
-    icon_from(size, |dc, s| {
+    render_pixels(size, |dc, s| {
         let u = |f: f32| (f * s as f32).round() as i32;
         let white = match (light, stale) {
             (false, false) => rgb(0xFF, 0xFF, 0xFF),
@@ -1889,6 +2192,256 @@ unsafe fn make_battery_icon(size: i32, pct: u8, charging: bool, stale: bool, gly
         let wdt = if text.len() >= 3 { ((inner.right - inner.left) as f32 / 3.4) as i32 } else { 0 };
         gdi_text(dc, &text, inner, "Segoe UI", (h * 1.05) as i32, wdt, 800, rgb(0xFF, 0xFF, 0xFF));
     })
+}
+
+// ------------------------------------------------------------------ widget en pantallas secundarias
+
+/// Elementos de batería que se muestran (tooltip, estado, dibujo del dispositivo).
+fn battery_items() -> Vec<(String, (u8, bool, bool), &'static str)> {
+    let a = app();
+    a.devices
+        .iter()
+        .filter_map(|d| {
+            let st = match d.battery {
+                Some(b) => (b.pct, b.charging, false),
+                None => (*a.last_battery.get(&d.key)?, false, true),
+            };
+            Some((format!("{} · {}", d.name, battery_text(d)), st, glyph(d)))
+        })
+        .collect()
+}
+
+/// Barras de tareas de las pantallas secundarias (Windows sólo pone la bandeja en la principal).
+fn secondary_taskbars() -> Vec<HWND> {
+    let mut out = Vec::new();
+    let class = wide("Shell_SecondaryTrayWnd");
+    let mut h: HWND = null_mut();
+    loop {
+        h = unsafe { FindWindowExW(null_mut(), h, class.as_ptr(), null()) };
+        if h.is_null() {
+            break;
+        }
+        out.push(h);
+    }
+    out
+}
+
+/// ¿Hay una aplicación a pantalla completa (p. ej. un juego) en la pantalla de esa barra?
+fn fullscreen_on(taskbar: HWND) -> bool {
+    unsafe {
+        // Lo que Windows considera pantalla completa (juegos, vídeo, presentaciones)
+        let mut state: i32 = 0;
+        SHQueryUserNotificationState(&mut state);
+        if !(2..=4).contains(&state) {
+            return false;
+        }
+        let fg = GetForegroundWindow();
+        if fg.is_null() {
+            return false;
+        }
+        let mut cls = [0u16; 32];
+        let n = GetClassNameW(fg, cls.as_mut_ptr(), 32) as usize;
+        let c = String::from_utf16_lossy(&cls[..n]);
+        if c == "Progman" || c == "WorkerW" || c.starts_with("Shell_") {
+            return false;
+        }
+        let mon = MonitorFromWindow(taskbar, MONITOR_DEFAULTTONEAREST);
+        if MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST) != mon {
+            return false;
+        }
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        GetMonitorInfoW(mon, &mut mi);
+        let mut r: RECT = std::mem::zeroed();
+        GetWindowRect(fg, &mut r);
+        r.left <= mi.rcMonitor.left && r.top <= mi.rcMonitor.top && r.right >= mi.rcMonitor.right && r.bottom >= mi.rcMonitor.bottom
+    }
+}
+
+/// Crea, coloca y redibuja los widgets. Barato: sólo redibuja si algo cambió.
+/// Trabaja con la escala propia de cada pantalla (per-monitor), para que funcione aunque las
+/// pantallas tengan escalas distintas (p. ej. 125 % y 100 %).
+fn update_widgets() {
+    unsafe {
+        let old = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        update_widgets_inner();
+        SetThreadDpiAwarenessContext(old);
+    }
+}
+
+fn update_widgets_inner() {
+    let a = app();
+    let items = battery_items();
+    let bars = if a.config.hide_widget || items.is_empty() { Vec::new() } else { secondary_taskbars() };
+    // Quitar los de barras que ya no existen
+    a.widgets.retain(|w| {
+        let keep = bars.contains(&w.taskbar);
+        if !keep {
+            unsafe {
+                DestroyWindow(w.hwnd);
+            }
+        }
+        keep
+    });
+    for tb in bars {
+        if !a.widgets.iter().any(|w| w.taskbar == tb) {
+            unsafe {
+                let hwnd = CreateWindowExW(
+                    WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+                    wide("CentroLEDWidget").as_ptr(),
+                    wide("Centro LED - batería").as_ptr(),
+                    WS_POPUP,
+                    0,
+                    0,
+                    1,
+                    1,
+                    null_mut(),
+                    null_mut(),
+                    GetModuleHandleW(null()),
+                    null(),
+                );
+                let tip = CreateWindowExW(WS_EX_TOPMOST, wide("tooltips_class32").as_ptr(), null(), WS_POPUP | 0x01 /* TTS_ALWAYSTIP */, 0, 0, 0, 0, hwnd, null_mut(), GetModuleHandleW(null()), null());
+                a.widgets.push(Widget { hwnd, taskbar: tb, tip, sig: String::new(), dpi: 96 });
+            }
+        }
+    }
+    for w in a.widgets.iter_mut() {
+        unsafe {
+            // Escala de la pantalla de esa barra
+            let dpi = GetDpiForWindow(w.taskbar).max(96);
+            let sc = |v: i32| v * dpi as i32 / 96;
+            // Icono a media altura de la barra (más legible que el tamaño de la bandeja)
+            let mut tr0: RECT = std::mem::zeroed();
+            GetWindowRect(w.taskbar, &mut tr0);
+            let icon = ((tr0.bottom - tr0.top) / 2).clamp(GetSystemMetricsForDpi(SM_CXSMICON, dpi).max(16), sc(32));
+            let item = icon + sc(14);
+            w.dpi = dpi;
+            let mut tr: RECT = std::mem::zeroed();
+            GetWindowRect(w.taskbar, &mut tr);
+            let h = tr.bottom - tr.top;
+            if IsWindowVisible(w.taskbar) == 0 || h < 16 || fullscreen_on(w.taskbar) {
+                ShowWindow(w.hwnd, SW_HIDE);
+                w.sig.clear();
+                continue;
+            }
+            let width = items.len() as i32 * item + sc(8);
+            let x = tr.right - sc(a.config.widget_offset) - width;
+            let sig = format!("{:?}{}{}{}{}", items, tr.left, tr.top, tr.right, a.config.widget_offset);
+            if sig != w.sig {
+                render_widget(w, &items, x, tr.top, width, h, icon, item, sc(4), sc(5));
+                w.sig = sig;
+            }
+            // Mantenerlo por encima de la barra de tareas
+            SetWindowPos(w.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        }
+    }
+}
+
+unsafe fn render_widget(w: &Widget, items: &[(String, (u8, bool, bool), &'static str)], x: i32, y: i32, width: i32, h: i32, icon: i32, item: i32, pad: i32, tip_pad: i32) {
+    let screen = GetDC(null_mut());
+    let dc = CreateCompatibleDC(screen);
+    let mut bmi: BITMAPINFO = std::mem::zeroed();
+    bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biHeight = -h;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    let mut bits: *mut core::ffi::c_void = null_mut();
+    let bmp = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+    let old = SelectObject(dc, bmp);
+    let dst = std::slice::from_raw_parts_mut(bits as *mut u32, (width * h) as usize);
+    // Fondo casi transparente para que toda la zona responda al ratón
+    dst.fill(0x0100_0000);
+    let top = (h - icon) / 2;
+    // Quitar herramientas anteriores del tooltip
+    SendMessageW(w.tip, WM_USER + 50 + 1, 0, 0);
+    DestroyWindow(w.tip);
+    let tip = CreateWindowExW(WS_EX_TOPMOST, wide("tooltips_class32").as_ptr(), null(), WS_POPUP | 0x01, 0, 0, 0, 0, w.hwnd, null_mut(), GetModuleHandleW(null()), null());
+    for (k, (text, st, g)) in items.iter().enumerate() {
+        let px = battery_pixels(icon, st.0, st.1, st.2, g);
+        let left = pad + k as i32 * item + (item - icon) / 2;
+        for yy in 0..icon {
+            for xx in 0..icon {
+                let v = px[(yy * icon + xx) as usize];
+                let al = v >> 24;
+                if al == 0 {
+                    continue;
+                }
+                // Premultiplicar para UpdateLayeredWindow
+                let pm = |c: u32| ((c & 0xFF) * al / 255) & 0xFF;
+                let out = (al << 24) | (pm(v >> 16) << 16) | (pm(v >> 8) << 8) | pm(v);
+                dst[((top + yy) * width + left + xx) as usize] = out;
+            }
+        }
+        // Tooltip con el nombre y la batería
+        let t = wide(text);
+        let mut ti: TTTOOLINFOW = std::mem::zeroed();
+        ti.cbSize = std::mem::size_of::<TTTOOLINFOW>() as u32;
+        ti.uFlags = 0x0010; // TTF_SUBCLASS
+        ti.hwnd = w.hwnd;
+        ti.uId = k;
+        ti.rect = RECT { left: left - tip_pad, top: 0, right: left + icon + tip_pad, bottom: h };
+        ti.lpszText = t.as_ptr() as *mut u16;
+        SendMessageW(tip, WM_USER + 50, 0, &ti as *const _ as LPARAM); // TTM_ADDTOOLW
+    }
+    let wp = &mut *(app().widgets.iter_mut().find(|x| x.hwnd == w.hwnd).unwrap() as *mut Widget);
+    wp.tip = tip;
+    let pos = POINT { x, y };
+    let size = SIZE { cx: width, cy: h };
+    let src = POINT { x: 0, y: 0 };
+    let blend = BLENDFUNCTION { BlendOp: 0, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: 1 };
+    UpdateLayeredWindow(w.hwnd, screen, &pos, &size, dc, &src, 0, &blend, ULW_ALPHA);
+    SelectObject(dc, old);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+    ReleaseDC(null_mut(), screen);
+}
+
+/// Ventana del widget: clic abre Centro LED, clic derecho el menú, arrastrar lo mueve.
+unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if APP.is_null() {
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+    let a = app();
+    match msg {
+        WM_LBUTTONDOWN => {
+            let mut pt = POINT { x: 0, y: 0 };
+            GetCursorPos(&mut pt);
+            a.widget_drag = Some((pt.x, a.config.widget_offset, false));
+            SetCapture(hwnd);
+            0
+        }
+        WM_MOUSEMOVE => {
+            if let Some((x0, off0, moved)) = a.widget_drag {
+                let mut pt = POINT { x: 0, y: 0 };
+                GetCursorPos(&mut pt);
+                let dx = pt.x - x0;
+                if moved || dx.abs() > 4 {
+                    a.widget_drag = Some((x0, off0, true));
+                    let dpi = a.widgets.iter().find(|w| w.hwnd == hwnd).map(|w| w.dpi).unwrap_or(96);
+                    a.config.widget_offset = (off0 - dx * 96 / dpi as i32).clamp(0, 1600);
+                    update_widgets();
+                }
+            }
+            0
+        }
+        WM_LBUTTONUP => {
+            ReleaseCapture();
+            if let Some((_, _, moved)) = a.widget_drag.take() {
+                if moved {
+                    save_config(&a.config);
+                } else {
+                    show_main();
+                }
+            }
+            0
+        }
+        WM_RBUTTONUP => {
+            tray_menu();
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
 }
 
 /// Sincroniza los iconos de batería de la barra de tareas con los dispositivos actuales.
@@ -2230,6 +2783,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_ERASEBKGND => 1,
+        0x020A => {
+            // WM_MOUSEWHEEL: desplazar la lista o el resumen
+            let delta = ((wp >> 16) & 0xFFFF) as i16 as i32;
+            let mut pt = POINT { x: (lp & 0xFFFF) as i16 as i32, y: ((lp >> 16) & 0xFFFF) as i16 as i32 };
+            ScreenToClient(hwnd, &mut pt);
+            let step = -delta * 66 / 120;
+            if pt.x < s(SIDEBAR_W) {
+                a.list_scroll = (a.list_scroll + step).clamp(0, a.list_max);
+            } else if a.page == 0 {
+                a.home_scroll = (a.home_scroll + step).clamp(0, a.home_max);
+            }
+            redraw();
+            0
+        }
         WM_LBUTTONDOWN => {
             let (x, y) = point(lp);
             if let Some(act) = hit_test(x, y) {
@@ -2301,6 +2868,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 } else {
                     KillTimer(hwnd, TIMER_ANIM);
                 }
+                return 0;
+            }
+            if wp == TIMER_WIDGET {
+                update_widgets();
                 return 0;
             }
             if wp == TIMER_UPDATE {
@@ -2393,6 +2964,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_DESTROY => {
             remove_tray();
+            for w in a.widgets.drain(..) {
+                DestroyWindow(w.hwnd);
+            }
             for t in a.tray_batt.values() {
                 tray_delete(t.id);
             }
@@ -2546,6 +3120,14 @@ unsafe fn do_render(args: &[String]) {
     }
     let key = args.get(2).cloned().unwrap_or_default();
     a.devices = devices::scan();
+    // "inicio" y "ajustes" dibujan esas páginas
+    if key == "inicio" || key == "ajustes" {
+        a.page = if key == "inicio" { 0 } else { 2 };
+        let out = args.get(4).cloned().unwrap_or_else(|| "render.bmp".into());
+        render_to_file(s(WIN_W), s(WIN_H), &out, |dc| paint(&Painter { dc }));
+        return;
+    }
+    a.page = 1;
     let Some(i) = a.devices.iter().position(|d| d.key == key) else { return };
     select_device(i);
     a.tab = args.get(3).and_then(|t| t.parse().ok()).unwrap_or(0);
@@ -2662,6 +3244,7 @@ fn main() {
             key_small: font(ui, 8, 600, scale),
             icon: font("Segoe Fluent Icons", 20, 400, scale),
             icon_big: font("Segoe Fluent Icons", 56, 400, scale),
+            small_icon: font("Segoe Fluent Icons", 15, 400, scale),
         };
 
         let hinst = GetModuleHandleW(null());
@@ -2679,6 +3262,20 @@ fn main() {
             lpszClassName: class.as_ptr(),
         };
         RegisterClassW(&wc);
+        let wclass = wide("CentroLEDWidget");
+        let wcw = WNDCLASSW {
+            style: 0,
+            lpfnWndProc: Some(widget_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hinst,
+            hIcon: null_mut(),
+            hCursor: LoadCursorW(null_mut(), IDC_HAND),
+            hbrBackground: null_mut(),
+            lpszMenuName: null(),
+            lpszClassName: wclass.as_ptr(),
+        };
+        RegisterClassW(&wcw);
 
         let app_box = Box::new(App {
             hwnd: null_mut(),
@@ -2718,6 +3315,13 @@ fn main() {
             next_tray_id: 100,
             upd: Upd::Idle,
             mutex,
+            page: 0,
+            list_scroll: 0,
+            list_max: 0,
+            home_scroll: 0,
+            home_max: 0,
+            widgets: Vec::new(),
+            widget_drag: None,
         });
         APP = Box::into_raw(app_box);
 
@@ -2769,6 +3373,8 @@ fn main() {
         // Batería cada minuto: el resto del tiempo la app está dormida.
         SetTimer(hwnd, TIMER_BATTERY, 60_000, None);
         SetTimer(hwnd, TIMER_UPDATE, 8_000, None);
+        // Widgets de batería en pantallas secundarias: reposicionar y mantener encima
+        SetTimer(hwnd, TIMER_WIDGET, 1_500, None);
         if updated {
             set_status(&format!("✓ Centro LED actualizado a la versión {}", update::VERSION));
         }

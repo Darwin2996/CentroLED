@@ -206,6 +206,75 @@ impl HidDev {
     pub fn get_feature(&self, buf: &mut [u8]) -> bool {
         unsafe { HidD_GetFeature(self.h, buf.as_mut_ptr() as _, buf.len() as u32) != 0 }
     }
+
+    pub fn get_input_report(&self, buf: &mut [u8]) -> bool {
+        unsafe { HidD_GetInputReport(self.h, buf.as_mut_ptr() as _, buf.len() as u32) != 0 }
+    }
+
+    /// Descriptor del dispositivo ya interpretado por Windows (para leer/escribir campos por "usage").
+    pub fn preparsed(&self) -> Option<Preparsed> {
+        unsafe {
+            let mut pp: PHIDP_PREPARSED_DATA = 0;
+            if HidD_GetPreparsedData(self.h, &mut pp) == 0 {
+                return None;
+            }
+            let mut caps: HIDP_CAPS = std::mem::zeroed();
+            HidP_GetCaps(pp, &mut caps);
+            Some(Preparsed { pp, caps })
+        }
+    }
+}
+
+pub const INPUT: i32 = 0;
+pub const FEATURE: i32 = 2;
+
+/// Descriptor HID interpretado: permite localizar un campo (página/uso) y leerlo o escribirlo
+/// en un report sin conocer su posición exacta.
+pub struct Preparsed {
+    pp: PHIDP_PREPARSED_DATA,
+    pub caps: HIDP_CAPS,
+}
+
+/// Campo de valor del descriptor: report en que está, colección y rango lógico.
+#[derive(Clone, Copy, Debug)]
+pub struct ValueCap {
+    pub report_id: u8,
+    pub link: u16,
+    pub min: i32,
+    pub max: i32,
+}
+
+impl Preparsed {
+    pub fn value_cap(&self, kind: i32, page: u16, usage: u16) -> Option<ValueCap> {
+        unsafe {
+            let mut caps: [HIDP_VALUE_CAPS; 8] = std::mem::zeroed();
+            let mut n: u16 = caps.len() as u16;
+            if HidP_GetSpecificValueCaps(kind, page, 0, usage, caps.as_mut_ptr(), &mut n, self.pp) != HIDP_STATUS_SUCCESS || n == 0 {
+                return None;
+            }
+            let c = &caps[0];
+            Some(ValueCap { report_id: c.ReportID, link: c.LinkCollection, min: c.LogicalMin, max: c.LogicalMax })
+        }
+    }
+
+    pub fn get(&self, kind: i32, page: u16, cap: &ValueCap, usage: u16, report: &[u8]) -> Option<u32> {
+        unsafe {
+            let mut v: u32 = 0;
+            (HidP_GetUsageValue(kind, page, cap.link, usage, &mut v, self.pp, report.as_ptr() as _, report.len() as u32) == HIDP_STATUS_SUCCESS).then_some(v)
+        }
+    }
+
+    pub fn set(&self, kind: i32, page: u16, link: u16, usage: u16, value: u32, report: &mut [u8]) -> bool {
+        unsafe { HidP_SetUsageValue(kind, page, link, usage, value, self.pp, report.as_mut_ptr() as _, report.len() as u32) == HIDP_STATUS_SUCCESS }
+    }
+}
+
+impl Drop for Preparsed {
+    fn drop(&mut self) {
+        unsafe {
+            HidD_FreePreparsedData(self.pp);
+        }
+    }
 }
 
 impl Drop for HidDev {
