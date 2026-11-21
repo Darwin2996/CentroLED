@@ -929,9 +929,9 @@ pub fn fast_start_set(on: bool) -> Result<(), String> {
     }
 }
 
-/// Al arrancar: si el programa se movió de carpeta, rehacer la tarea (en segundo plano).
+/// Al arrancar: si la tarea falta o apunta a un .exe que ya no existe (se movió), rehacerla
+/// (en segundo plano). Si apunta a otra copia que sí existe, se deja.
 pub fn fast_start_check() {
-    let exe = std::env::current_exe().map(|p| p.display().to_string().to_lowercase()).unwrap_or_default();
     std::thread::spawn(move || {
         let ok = schtasks(&["/query", "/tn", TASK, "/xml"])
             .filter(|o| o.status.success())
@@ -941,7 +941,8 @@ pub fn fast_start_check() {
                 } else {
                     String::from_utf8_lossy(&o.stdout).into_owned()
                 };
-                text.to_lowercase().replace("&amp;", "&").contains(&exe)
+                let text = text.replace("&amp;", "&");
+                text.split("<Command>").nth(1).and_then(|c| c.split("</Command>").next()).map(|c| std::path::Path::new(c.trim()).exists()).unwrap_or(false)
             })
             .unwrap_or(false);
         if !ok {

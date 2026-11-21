@@ -3910,15 +3910,17 @@ fn main() {
             RegSetValueExW(ukey, wide("DisplayVersion").as_ptr(), 0, REG_SZ, v.as_ptr() as *const u8, (v.len() * 2) as u32);
             RegCloseKey(ukey);
         }
-        // Si el inicio automático apunta a otra copia del programa (se movió el .exe), corregirlo.
+        // Si el inicio automático apunta a un .exe que ya no existe (se movió), corregirlo.
+        // Si apunta a otra copia que sí existe (p. ej. se abrió una portable), no tocarlo.
         if app().config.fast_start {
             if autostart_value().is_some() {
                 set_autostart(false);
                 app().autostart = false;
             }
             state::fast_start_check();
-        } else if let (Some(v), Ok(exe)) = (autostart_value(), std::env::current_exe()) {
-            if !v.to_lowercase().contains(&exe.display().to_string().to_lowercase()) {
+        } else if let Some(v) = autostart_value() {
+            let target = v.trim_start_matches('"').split('"').next().unwrap_or("").to_string();
+            if !std::path::Path::new(&target).exists() {
                 set_autostart(true);
             }
         }
