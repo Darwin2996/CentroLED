@@ -1,11 +1,13 @@
 //! Compatibilidad genérica basada en estándares:
 //! - Batería HID estándar ("Battery Strength", página 0x06) que exponen muchos periféricos.
 //! - Ratones, teclados y cascos Razer (protocolo de informes de 90 bytes): batería.
-//! - Luces HID LampArray ("Dynamic Lighting" de Windows 11): color de todo el dispositivo.
+//! - Luces HID LampArray ("Dynamic Lighting" de Windows 11): color fijo, color por tecla en los
+//!   teclados y vuelta a los efectos propios del dispositivo.
 
-use crate::devices::{Battery, Device, Driver, LedCaps, MODE_OFF};
+use crate::devices::{scaled, Battery, Device, Driver, LedCaps, LedSetting, KB_LEDS, MODE_CUSTOM, MODE_DEVICE, MODE_OFF};
 use crate::hid::{HidDev, HidInfo, FEATURE, INPUT};
 use std::collections::HashSet;
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// Tipo de dispositivo según las colecciones estándar que tiene.
@@ -106,6 +108,8 @@ fn razer_battery(i: &HidInfo) -> Option<Battery> {
 const PAGE_LIGHTING: u16 = 0x59;
 const U_LAMP_ARRAY: u16 = 0x01;
 const U_LAMP_COUNT: u16 = 0x03;
+const U_LAMP_ID: u16 = 0x21;
+const U_INPUT_BINDING: u16 = 0x2D;
 const U_RED: u16 = 0x51;
 const U_GREEN: u16 = 0x52;
 const U_BLUE: u16 = 0x53;
@@ -124,37 +128,102 @@ fn lamp_count(dev: &HidDev) -> Option<u32> {
     pp.get(FEATURE, PAGE_LIGHTING, &cap, U_LAMP_COUNT, &buf)
 }
 
-/// Pone todas las luces del dispositivo en un color (desactiva antes el modo autónomo).
-pub fn lamparray_apply(path: &[u16], rgb: (u8, u8, u8)) -> Result<(), String> {
+/// Tecla del dibujo que ilumina cada lámpara, según su "InputBinding" (código HID de la tecla).
+/// Se pregunta una vez por dispositivo y se recuerda.
+fn lamp_keys(dev: &HidDev, path: &[u16], count: u32) -> Vec<Option<u8>> {
+    static CACHE: Mutex<Vec<(Vec<u16>, Vec<Option<u8>>)>> = Mutex::new(Vec::new());
+    if let Some(k) = CACHE.lock().unwrap().iter().find(|c| c.0 == path) {
+        return k.1.clone();
+    }
+    let mut keys = vec![None; count as usize];
+    if let Some(pp) = dev.preparsed() {
+        let flen = pp.caps.FeatureReportByteLength as usize;
+        let resp = pp.value_cap(FEATURE, PAGE_LIGHTING, U_INPUT_BINDING);
+        let req = resp.and_then(|r| pp.value_caps(FEATURE, PAGE_LIGHTING, U_LAMP_ID).into_iter().find(|c| c.report_id != r.report_id));
+        if let (Some(resp), Some(req)) = (resp, req) {
+            for id in 0..count {
+                let mut buf = vec![0u8; flen];
+                buf[0] = req.report_id;
+                pp.set(FEATURE, PAGE_LIGHTING, req.link, U_LAMP_ID, id, &mut buf);
+                if !dev.set_feature(&buf) {
+                    break;
+                }
+                let mut r = vec![0u8; flen];
+                r[0] = resp.report_id;
+                if !dev.get_feature(&mut r) {
+                    break;
+                }
+                let got = pp.value_caps(FEATURE, PAGE_LIGHTING, U_LAMP_ID).into_iter().find(|c| c.report_id == resp.report_id).and_then(|c| pp.get(FEATURE, PAGE_LIGHTING, &c, U_LAMP_ID, &r));
+                let lamp = got.unwrap_or(id) as usize;
+                if let (Some(slot), Some(usage)) = (keys.get_mut(lamp), pp.get(FEATURE, PAGE_LIGHTING, &resp, U_INPUT_BINDING, &r)) {
+                    *slot = crate::kb_layout::index_of_usage(usage);
+                }
+            }
+        }
+    }
+    CACHE.lock().unwrap().push((path.to_vec(), keys.clone()));
+    keys
+}
+
+fn has_autonomous(path: &[u16]) -> bool {
+    HidDev::open_feature(path).and_then(|d| d.preparsed()).map(|pp| pp.value_cap(FEATURE, PAGE_LIGHTING, U_AUTONOMOUS).is_some()).unwrap_or(false)
+}
+
+/// Aplica un ajuste a un dispositivo Dynamic Lighting: color fijo, color por tecla (`keys`),
+/// apagado o devolver el control a los efectos del propio dispositivo.
+pub fn lamparray_apply(path: &[u16], s: &LedSetting, keys: Option<&[[u8; 3]; KB_LEDS]>) -> Result<(), String> {
     let dev = HidDev::open_feature(path).ok_or("No se pudo abrir el dispositivo")?;
     let pp = dev.preparsed().ok_or("Descriptor no válido")?;
     let count = lamp_count(&dev).unwrap_or(1).max(1);
     let flen = pp.caps.FeatureReportByteLength as usize;
-    // 1. Control: modo autónomo desactivado (la app manda)
+    // 1. Control: modo autónomo sólo con "Efectos del dispositivo"
+    let autonomous = s.mode == MODE_DEVICE;
     if let Some(cap) = pp.value_cap(FEATURE, PAGE_LIGHTING, U_AUTONOMOUS) {
         let mut buf = vec![0u8; flen];
         buf[0] = cap.report_id;
-        pp.set(FEATURE, PAGE_LIGHTING, cap.link, U_AUTONOMOUS, 0, &mut buf);
-        dev.set_feature(&buf);
+        pp.set(FEATURE, PAGE_LIGHTING, cap.link, U_AUTONOMOUS, autonomous as u32, &mut buf);
+        if !dev.set_feature(&buf) && autonomous {
+            return Err("El dispositivo no aceptó volver a sus efectos".into());
+        }
     }
-    // 2. Actualizar el rango completo de lámparas
-    let cap = pp.value_cap(FEATURE, PAGE_LIGHTING, U_LAMP_ID_START).ok_or("El dispositivo no admite actualizar luces por rango")?;
-    let mut buf = vec![0u8; flen];
-    buf[0] = cap.report_id;
-    let l = cap.link;
-    let scale = |c: u8, u: u16| -> u32 {
-        let max = pp.value_cap(FEATURE, PAGE_LIGHTING, u).map(|c| c.max).unwrap_or(255).max(1) as u32;
-        c as u32 * max / 255
+    if autonomous {
+        return Ok(());
+    }
+    // 2. Color de cada lámpara
+    let colors: Vec<[u8; 3]> = match (s.mode, keys) {
+        (MODE_CUSTOM, Some(k)) => crate::devices::per_led_colors(&lamp_keys(&dev, path, count), k, s.bright),
+        _ => {
+            let c = scaled(s);
+            vec![[c.0, c.1, c.2]; count as usize]
+        }
     };
-    pp.set(FEATURE, PAGE_LIGHTING, l, U_UPDATE_FLAGS, 1, &mut buf);
-    pp.set(FEATURE, PAGE_LIGHTING, l, U_LAMP_ID_START, 0, &mut buf);
-    pp.set(FEATURE, PAGE_LIGHTING, l, U_LAMP_ID_END, count - 1, &mut buf);
-    pp.set(FEATURE, PAGE_LIGHTING, l, U_RED, scale(rgb.0, U_RED), &mut buf);
-    pp.set(FEATURE, PAGE_LIGHTING, l, U_GREEN, scale(rgb.1, U_GREEN), &mut buf);
-    pp.set(FEATURE, PAGE_LIGHTING, l, U_BLUE, scale(rgb.2, U_BLUE), &mut buf);
-    let on = if rgb == (0, 0, 0) { 0 } else { 255 };
-    pp.set(FEATURE, PAGE_LIGHTING, l, U_INTENSITY, scale(on, U_INTENSITY), &mut buf);
-    if dev.set_feature(&buf) { Ok(()) } else { Err("El dispositivo no aceptó el color".into()) }
+    // 3. Enviar por rangos de lámparas seguidas con el mismo color; el último report confirma.
+    let cap = pp.value_cap(FEATURE, PAGE_LIGHTING, U_LAMP_ID_START).ok_or("El dispositivo no admite actualizar luces por rango")?;
+    let l = cap.link;
+    let max = |u: u16| pp.value_cap(FEATURE, PAGE_LIGHTING, u).map(|c| c.max).unwrap_or(255).max(1) as u32;
+    let (mr, mg, mb, mi) = (max(U_RED), max(U_GREEN), max(U_BLUE), max(U_INTENSITY));
+    let mut start = 0usize;
+    while start < colors.len() {
+        let c = colors[start];
+        let mut end = start;
+        while end + 1 < colors.len() && colors[end + 1] == c {
+            end += 1;
+        }
+        let mut buf = vec![0u8; flen];
+        buf[0] = cap.report_id;
+        pp.set(FEATURE, PAGE_LIGHTING, l, U_UPDATE_FLAGS, (end + 1 == colors.len()) as u32, &mut buf);
+        pp.set(FEATURE, PAGE_LIGHTING, l, U_LAMP_ID_START, start as u32, &mut buf);
+        pp.set(FEATURE, PAGE_LIGHTING, l, U_LAMP_ID_END, end as u32, &mut buf);
+        pp.set(FEATURE, PAGE_LIGHTING, l, U_RED, c[0] as u32 * mr / 255, &mut buf);
+        pp.set(FEATURE, PAGE_LIGHTING, l, U_GREEN, c[1] as u32 * mg / 255, &mut buf);
+        pp.set(FEATURE, PAGE_LIGHTING, l, U_BLUE, c[2] as u32 * mb / 255, &mut buf);
+        pp.set(FEATURE, PAGE_LIGHTING, l, U_INTENSITY, if c == [0; 3] { 0 } else { mi }, &mut buf);
+        if !dev.set_feature(&buf) {
+            return Err("El dispositivo no aceptó el color".into());
+        }
+        start = end + 1;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- búsqueda
@@ -167,14 +236,24 @@ pub fn scan(all: &[HidInfo], handled: &mut HashSet<(u16, u16)>) -> Vec<Device> {
             continue;
         }
         let name = product_name(i, all).unwrap_or_else(|| format!("Dispositivo RGB {:04X}:{:04X}", i.vid, i.pid));
+        let kind = kind_of(i, all);
+        let keyboard = kind == "Teclado";
+        let mut modes = vec![("Estático", 1)];
+        if keyboard {
+            modes.push(("Personalizado", MODE_CUSTOM));
+        }
+        if has_autonomous(&i.path) {
+            modes.push(("Efectos del dispositivo", MODE_DEVICE));
+        }
+        modes.push(("Apagado", MODE_OFF));
         out.push(Device {
             key: format!("lamp-{:04x}-{:04x}", i.vid, i.pid),
             name,
-            kind: kind_of(i, all),
+            kind,
             conn: "USB · Dynamic Lighting",
             battery: None,
             battery_note: "—",
-            led: Some(LedCaps { modes: vec![("Estático", 1), ("Apagado", MODE_OFF)], speed: false, multicolor: false, volatile: true, zones: vec![], pad_extras: false }),
+            led: Some(LedCaps { modes, speed: false, multicolor: false, volatile: true, zones: vec![], pad_extras: false, keymap: keyboard }),
             driver: Driver::LampArray { path: i.path.clone() },
         });
     }

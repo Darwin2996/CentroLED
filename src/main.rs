@@ -855,7 +855,13 @@ fn selected() -> Option<Device> {
     a.devices.iter().find(|d| &d.key == key).cloned()
 }
 
+/// Teclado con editor tecla a tecla (Tempest, o cualquier teclado de OpenRGB / Dynamic Lighting).
 fn is_keyboard(d: &Device) -> bool {
+    d.led.as_ref().map(|l| l.keymap).unwrap_or(false)
+}
+
+/// Sólo el Tempest tiene una tira de luz en el borde con sus propios efectos.
+fn has_rim(d: &Device) -> bool {
     matches!(d.driver, devices::Driver::Tempest { .. })
 }
 
@@ -1856,7 +1862,7 @@ fn paint_device(p: &Painter, d: &Device, x: i32, w: i32) {
     let keyboard = is_keyboard(d);
     let mut y = 96;
     // Pestañas: Teclas / Borde en el teclado, o una por zona de luz.
-    let tab_names: Vec<String> = if keyboard { vec!["Teclas".into(), "Borde".into()] } else { caps.zones.clone() };
+    let tab_names: Vec<String> = if keyboard && has_rim(d) { vec!["Teclas".into(), "Borde".into()] } else if keyboard { Vec::new() } else { caps.zones.clone() };
     if !tab_names.is_empty() {
         let widths: Vec<i32> = tab_names.iter().map(|n| (p.measure(n, a.fonts.bold) + 40).max(116)).collect();
         let tabs = p.rect(x, y, widths.iter().sum::<i32>() + 8, 36);
@@ -1879,7 +1885,7 @@ fn paint_device(p: &Painter, d: &Device, x: i32, w: i32) {
         }
     }
     if keyboard {
-        y += 52;
+        y += if tab_names.is_empty() { 4 } else { 52 };
         a.preview = Some((true, x, y, w));
         y = paint_keyboard(p, x, y, w) + 18;
     } else {
@@ -2273,7 +2279,8 @@ fn preview_animates() -> bool {
         return false;
     }
     match selected() {
-        Some(d) if is_keyboard(&d) => !matches!(a.cur.mode, 1 | MODE_CUSTOM | MODE_OFF) || !matches!(a.rim.mode, 24 | 25),
+        Some(d) if has_rim(&d) => !matches!(a.cur.mode, 1 | MODE_CUSTOM | MODE_OFF) || !matches!(a.rim.mode, 24 | 25),
+        Some(d) if is_keyboard(&d) => false,
         Some(d) => d.led.is_some() && a.zones.is_empty() && is_app_animated(a.cur.mode) && (a.cur.mode != MODE_CYCLE || a.cycle.len() >= 2),
         None => false,
     }
@@ -2289,9 +2296,10 @@ fn paint_keyboard(p: &Painter, x: i32, y: i32, w: i32) -> i32 {
     a.anim_rect = RECT { left: frame.left - s(14), top: frame.top - s(14), right: frame.right + s(14), bottom: frame.bottom + s(14) };
 
     // Borde (tira de luz): resplandor exterior y trazo por segmentos con el efecto simulado.
+    let rim = selected().map(|d| has_rim(&d)).unwrap_or(false);
     let rb = a.rim.bright as f32 / 100.0;
     let (glow_c, glow_k) = rim_effect(0.0);
-    if a.rim.mode != 25 {
+    if rim && a.rim.mode != 25 {
         for g in 0..3 {
             let grow = 3 + g * 3;
             let fr = RECT { left: frame.left - s(grow), top: frame.top - s(grow), right: frame.right + s(grow), bottom: frame.bottom + s(grow) };
@@ -2300,7 +2308,7 @@ fn paint_keyboard(p: &Painter, x: i32, y: i32, w: i32) -> i32 {
     }
     p.fill(&frame, rgb(0x16, 0x16, 0x1D), 18);
     p.stroke(&frame, th().line, 18, 1);
-    if a.rim.mode != 25 {
+    if rim && a.rim.mode != 25 {
         let inset = s(3);
         let (l, t, r, b) = (frame.left + inset, frame.top + inset, frame.right - inset, frame.bottom - inset);
         let (fw, fh) = ((r - l) as f32, (b - t) as f32);
@@ -2334,7 +2342,7 @@ fn paint_keyboard(p: &Painter, x: i32, y: i32, w: i32) -> i32 {
             }
         }
     }
-    if a.tab == 1 {
+    if rim && a.tab == 1 {
         hit(frame, Act::Tab(1));
     }
 

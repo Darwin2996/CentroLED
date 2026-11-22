@@ -257,6 +257,18 @@ impl Preparsed {
         }
     }
 
+    /// Todos los campos con ese uso (p. ej. el mismo uso en varios reports).
+    pub fn value_caps(&self, kind: i32, page: u16, usage: u16) -> Vec<ValueCap> {
+        unsafe {
+            let mut caps: [HIDP_VALUE_CAPS; 8] = std::mem::zeroed();
+            let mut n: u16 = caps.len() as u16;
+            if HidP_GetSpecificValueCaps(kind, page, 0, usage, caps.as_mut_ptr(), &mut n, self.pp) != HIDP_STATUS_SUCCESS {
+                return Vec::new();
+            }
+            caps[..n as usize].iter().map(|c| ValueCap { report_id: c.ReportID, link: c.LinkCollection, min: c.LogicalMin, max: c.LogicalMax }).collect()
+        }
+    }
+
     pub fn get(&self, kind: i32, page: u16, cap: &ValueCap, usage: u16, report: &[u8]) -> Option<u32> {
         unsafe {
             let mut v: u32 = 0;

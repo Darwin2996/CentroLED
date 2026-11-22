@@ -106,3 +106,148 @@ pub const KEYS: &[(usize, &str, i32, i32, i32, i32)] = &[
     (122, "-", 625, 30, 24, 22),
     (123, "+", 625, 58, 24, 51),
 ];
+
+// ---------------------------------------------------------------- teclas de otros teclados
+//
+// Para los teclados genéricos (OpenRGB y Dynamic Lighting) cada LED se identifica por la tecla
+// que ilumina (código de uso HID del teclado). Esta tabla lleva cada código a su tecla del
+// dibujo, de modo que el mismo editor tecla a tecla sirve para cualquier teclado.
+
+/// (índice de LED del dibujo, código de uso HID de la página de teclado 0x07).
+const USAGES: &[(u8, u8)] = &[
+    (1, 0x29), (2, 0x3A), (3, 0x3B), (4, 0x3C), (5, 0x3D), (6, 0x3E), (7, 0x3F), (8, 0x40),
+    (9, 0x41), (10, 0x42), (11, 0x43), (12, 0x44), (13, 0x45),
+    (19, 0x35), (20, 0x1E), (21, 0x1F), (22, 0x20), (23, 0x21), (24, 0x22), (25, 0x23), (26, 0x24),
+    (27, 0x25), (28, 0x26), (29, 0x27), (30, 0x2D), (31, 0x2E), (32, 0x53), (33, 0x54), (34, 0x55),
+    (37, 0x2B), (38, 0x14), (39, 0x1A), (40, 0x08), (41, 0x15), (42, 0x17), (43, 0x1C), (44, 0x18),
+    (45, 0x0C), (46, 0x12), (47, 0x13), (48, 0x2F), (49, 0x30), (50, 0x5F), (51, 0x60), (52, 0x61),
+    (55, 0x39), (56, 0x04), (57, 0x16), (58, 0x07), (59, 0x09), (60, 0x0A), (61, 0x0B), (62, 0x0D),
+    (63, 0x0E), (64, 0x0F), (65, 0x33), (66, 0x34), (67, 0x32), (67, 0x31), (68, 0x5C), (69, 0x5D),
+    (70, 0x5E), (73, 0xE1), (74, 0x1D), (75, 0x1B), (76, 0x06), (77, 0x19), (78, 0x05), (79, 0x11),
+    (80, 0x10), (81, 0x36), (82, 0x37), (83, 0x38), (84, 0xE5), (85, 0x28), (86, 0x59), (87, 0x5A),
+    (88, 0x5B), (91, 0xE0), (92, 0xE3), (92, 0xE7), (93, 0xE2), (94, 0x2C), (95, 0xE6), (97, 0x65),
+    (98, 0xE4), (99, 0x50), (100, 0x51), (101, 0x52), (102, 0x4F), (103, 0x2A), (104, 0x62),
+    (105, 0x63), (106, 0x58), (112, 0x46), (113, 0x47), (115, 0x48), (116, 0x49), (117, 0x4A),
+    (118, 0x4B), (119, 0x4C), (120, 0x4D), (121, 0x4E), (122, 0x56), (123, 0x57),
+];
+
+/// Tecla del dibujo para un código de uso HID de teclado.
+pub fn index_of_usage(usage: u32) -> Option<u8> {
+    USAGES.iter().find(|u| u.1 as u32 == usage).map(|u| u.0)
+}
+
+/// Código de uso HID a partir del nombre de LED de OpenRGB ("Key: A", "Key: Left Shift"…).
+pub fn usage_of_name(name: &str) -> Option<u8> {
+    let n = name.strip_prefix("Key:").unwrap_or(name).trim().to_lowercase();
+    let n = n.as_str();
+    let b = n.as_bytes();
+    if b.len() == 1 {
+        return match b[0] {
+            c @ b'a'..=b'z' => Some(0x04 + c - b'a'),
+            b'0' => Some(0x27),
+            c @ b'1'..=b'9' => Some(0x1E + c - b'1'),
+            b'`' => Some(0x35),
+            b'-' => Some(0x2D),
+            b'=' => Some(0x2E),
+            b'[' => Some(0x2F),
+            b']' => Some(0x30),
+            b';' => Some(0x33),
+            b'\'' => Some(0x34),
+            b'#' => Some(0x32),
+            b',' => Some(0x36),
+            b'.' => Some(0x37),
+            b'/' => Some(0x38),
+            _ => None,
+        };
+    }
+    if let Some(f) = n.strip_prefix('f').and_then(|f| f.parse::<u8>().ok()) {
+        return (1..=12).contains(&f).then(|| 0x3A + f - 1);
+    }
+    for p in ["number pad ", "numpad ", "num pad ", "keypad ", "kp "] {
+        if let Some(k) = n.strip_prefix(p) {
+            return match k {
+                "/" => Some(0x54),
+                "*" => Some(0x55),
+                "-" => Some(0x56),
+                "+" => Some(0x57),
+                "enter" => Some(0x58),
+                "0" => Some(0x62),
+                "." | "del" | "delete" => Some(0x63),
+                d if d.len() == 1 && (b'1'..=b'9').contains(&d.as_bytes()[0]) => Some(0x59 + d.as_bytes()[0] - b'1'),
+                _ => None,
+            };
+        }
+    }
+    Some(match n {
+        "escape" | "esc" => 0x29,
+        "print screen" | "prtsc" | "print" => 0x46,
+        "scroll lock" => 0x47,
+        "pause/break" | "pause" | "break" => 0x48,
+        "backspace" => 0x2A,
+        "insert" | "ins" => 0x49,
+        "home" => 0x4A,
+        "page up" | "pgup" => 0x4B,
+        "delete" | "del" => 0x4C,
+        "end" => 0x4D,
+        "page down" | "pgdn" => 0x4E,
+        "num lock" | "numlock" => 0x53,
+        "tab" => 0x2B,
+        "caps lock" | "capslock" => 0x39,
+        "enter" | "return" => 0x28,
+        "\\ (ansi)" | "\\" => 0x31,
+        "\\ (iso)" => 0x64,
+        "left shift" | "lshift" => 0xE1,
+        "right shift" | "rshift" => 0xE5,
+        "left control" | "left ctrl" | "lctrl" => 0xE0,
+        "right control" | "right ctrl" | "rctrl" => 0xE4,
+        "left windows" | "left win" | "lwin" | "windows" | "left super" => 0xE3,
+        "right windows" | "right win" | "rwin" => 0xE7,
+        "left alt" | "lalt" => 0xE2,
+        "right alt" | "ralt" | "alt gr" | "altgr" => 0xE6,
+        "space" | "spacebar" => 0x2C,
+        "menu" | "context menu" | "application" => 0x65,
+        "up arrow" | "up" => 0x52,
+        "down arrow" | "down" => 0x51,
+        "left arrow" | "left" => 0x50,
+        "right arrow" | "right" => 0x4F,
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Nombres de tecla de OpenRGB de un teclado completo (ANSI + ISO).
+    const OPENRGB: &[&str] = &[
+        "Escape", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "Print Screen", "Scroll Lock", "Pause/Break",
+        "`", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "-", "=", "Backspace", "Insert", "Home", "Page Up",
+        "Num Lock", "Number Pad /", "Number Pad *", "Number Pad -", "Tab", "Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P",
+        "[", "]", "\\ (ANSI)", "Delete", "End", "Page Down", "Number Pad 7", "Number Pad 8", "Number Pad 9", "Number Pad +",
+        "Caps Lock", "A", "S", "D", "F", "G", "H", "J", "K", "L", ";", "'", "#", "Enter", "Number Pad 4", "Number Pad 5",
+        "Number Pad 6", "Left Shift", "Z", "X", "C", "V", "B", "N", "M", ",", ".", "/", "Right Shift", "Up Arrow",
+        "Number Pad 1", "Number Pad 2", "Number Pad 3", "Number Pad Enter", "Left Control", "Left Windows", "Left Alt",
+        "Space", "Right Alt", "Menu", "Right Control", "Left Arrow", "Down Arrow", "Right Arrow", "Number Pad 0", "Number Pad .",
+    ];
+
+    #[test]
+    fn openrgb_names_cover_the_drawing() {
+        let mut lit = std::collections::HashSet::new();
+        for n in OPENRGB {
+            let u = usage_of_name(&format!("Key: {n}")).unwrap_or_else(|| panic!("sin código: {n}"));
+            let i = index_of_usage(u as u32).unwrap_or_else(|| panic!("sin tecla en el dibujo: {n}"));
+            assert!(KEYS.iter().any(|k| k.0 == i as usize), "{n}");
+            lit.insert(i);
+        }
+        // Todas las teclas del dibujo salvo Fn reciben luz
+        let missing: Vec<&str> = KEYS.iter().filter(|k| !lit.contains(&(k.0 as u8))).map(|k| k.1).collect();
+        assert_eq!(missing, vec!["FN"]);
+    }
+
+    #[test]
+    fn every_usage_points_to_a_drawn_key() {
+        for &(i, _) in USAGES {
+            assert!(KEYS.iter().any(|k| k.0 == i as usize), "LED {i}");
+        }
+    }
+}

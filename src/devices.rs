@@ -20,6 +20,10 @@ pub const MODE_CYCLE: u8 = 0xF0;
 /// Respiración y arcoíris animados por la app (mandos).
 pub const MODE_SW_BREATH: u8 = 0xF1;
 pub const MODE_SW_RAINBOW: u8 = 0xF2;
+/// Dynamic Lighting: el dispositivo vuelve a sus propios efectos.
+pub const MODE_DEVICE: u8 = 0xE0;
+/// Efectos de hardware de OpenRGB: 0x40 + posición del modo en el dispositivo.
+pub const MODE_ORGB: u8 = 0x40;
 
 /// ¿El modo lo anima la app (en vez del propio dispositivo)?
 pub fn is_app_animated(mode: u8) -> bool {
@@ -37,6 +41,8 @@ pub struct LedCaps {
     pub zones: Vec<String>,
     /// LEDs de jugador y de micrófono (DualSense).
     pub pad_extras: bool,
+    /// Teclado con color por tecla: usa el editor de teclas.
+    pub keymap: bool,
 }
 
 /// Luces secundarias del DualSense.
@@ -86,7 +92,8 @@ pub enum Driver {
     DualShock4 { path: Vec<u16>, bt: bool },
     Logitech { path: Vec<u16>, idx: u8, led_feat: u8, zones: Vec<LogiZone> },
     Switch { path: Vec<u16>, out_len: u16, home: bool },
-    OpenRgb { index: u32, leds: u16 },
+    /// `keymap`: tecla del dibujo que ilumina cada LED (None si no es una tecla conocida).
+    OpenRgb { index: u32, leds: u16, modes: Vec<crate::openrgb::OrgbMode>, keymap: Vec<Option<u8>> },
     LampArray { path: Vec<u16> },
     None,
 }
@@ -121,7 +128,7 @@ pub fn scan() -> Vec<Device> {
             conn: "USB",
             battery: None,
             battery_note: "Con cable",
-            led: Some(LedCaps { modes: TEMPEST_MODES.to_vec(), speed: true, multicolor: true, volatile: false, zones: vec![], pad_extras: false }),
+            led: Some(LedCaps { modes: TEMPEST_MODES.to_vec(), speed: true, multicolor: true, volatile: false, zones: vec![], pad_extras: false, keymap: true }),
             driver: Driver::Tempest { path: i.path.clone() },
         });
     }
@@ -161,6 +168,7 @@ pub fn scan() -> Vec<Device> {
                 volatile: true,
                 zones: vec![],
                 pad_extras: ds5,
+                keymap: false,
             }),
             driver,
         });
@@ -227,16 +235,7 @@ pub fn scan() -> Vec<Device> {
         if native.iter().any(|n| l.contains(n)) {
             continue;
         }
-        out.push(Device {
-            key: format!("orgb-{}", o.name),
-            name: o.name.clone(),
-            kind: o.kind,
-            conn: "OpenRGB",
-            battery: None,
-            battery_note: "—",
-            led: Some(LedCaps { modes: vec![("Estático", 1), ("Apagado", MODE_OFF)], speed: false, multicolor: false, volatile: true, zones: vec![], pad_extras: false }),
-            driver: Driver::OpenRgb { index: o.index, leds: o.leds },
-        });
+        out.push(openrgb_device(o));
     }
 
     // Resto de dispositivos USB con nombre (sólo informativo)
@@ -288,6 +287,114 @@ fn describe_other(i: &HidInfo, all: &[HidInfo]) -> (String, &'static str) {
     (name, kind)
 }
 
+/// Nombre en español de los efectos más comunes de OpenRGB.
+fn mode_name(n: &str) -> &'static str {
+    let es = match n.to_lowercase().as_str() {
+        "static" => "Estático",
+        "breathing" => "Respiración",
+        "spectrum cycle" | "spectrum" => "Espectro",
+        "rainbow wave" | "rainbow" => "Ola arcoíris",
+        "wave" | "color wave" => "Ola",
+        "reactive" => "Reactivo",
+        "reactive ripple" | "ripple" => "Ondas",
+        "starlight" | "stars" => "Estrellas",
+        "rain" | "raindrop" | "raindrops" => "Lluvia",
+        "flashing" | "blink" => "Parpadeo",
+        "color cycle" | "color shift" => "Ciclo de color",
+        "marquee" => "Marquesina",
+        "fire" => "Fuego",
+        "random" => "Aleatorio",
+        _ => "",
+    };
+    if !es.is_empty() {
+        return es;
+    }
+    // Los nombres que llegan de OpenRGB se guardan una sola vez (la lista se vuelve a pedir a menudo).
+    static NAMES: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    let mut v = NAMES.lock().unwrap();
+    if let Some(s) = v.iter().find(|s| **s == n) {
+        return s;
+    }
+    let s: &'static str = Box::leak(n.to_string().into_boxed_str());
+    v.push(s);
+    s
+}
+
+/// Dispositivo de OpenRGB con sus efectos de hardware y, en los teclados, el mapa de teclas.
+fn openrgb_device(o: crate::openrgb::OrgbDevice) -> Device {
+    let keymap: Vec<Option<u8>> = o.led_names.iter().map(|n| crate::kb_layout::usage_of_name(n).and_then(|u| crate::kb_layout::index_of_usage(u as u32))).collect();
+    let direct = o.modes.iter().any(|m| m.is_direct());
+    let per_key = direct && o.kind == "Teclado" && keymap.iter().flatten().count() >= 20;
+    let mut modes = vec![("Estático", 1)];
+    if per_key {
+        modes.push(("Personalizado", MODE_CUSTOM));
+    }
+    for (i, m) in o.modes.iter().enumerate().take(0x40) {
+        let l = m.name.to_lowercase();
+        if m.is_direct() || l == "static" || l == "off" {
+            continue;
+        }
+        let name = mode_name(&m.name);
+        if !modes.iter().any(|x| x.0 == name) {
+            modes.push((name, MODE_ORGB + i as u8));
+        }
+    }
+    modes.push(("Apagado", MODE_OFF));
+    let speed = o.modes.iter().any(|m| m.has_speed());
+    let multicolor = o.modes.iter().any(|m| m.has_random());
+    Device {
+        key: format!("orgb-{}", o.name),
+        name: o.name.clone(),
+        kind: o.kind,
+        conn: "OpenRGB",
+        battery: None,
+        battery_note: "—",
+        led: Some(LedCaps { modes, speed, multicolor, volatile: true, zones: vec![], pad_extras: false, keymap: per_key }),
+        driver: Driver::OpenRgb { index: o.index, leds: o.leds, modes: o.modes, keymap },
+    }
+}
+
+/// Color de cada LED en el modo por teclas: el de su tecla, o el más usado si no es una tecla.
+pub fn per_led_colors(keymap: &[Option<u8>], keys: &[[u8; 3]; KB_LEDS], bright: u8) -> Vec<[u8; 3]> {
+    let mut count: Vec<([u8; 3], usize)> = Vec::new();
+    for &(idx, ..) in crate::kb_layout::KEYS {
+        match count.iter_mut().find(|c| c.0 == keys[idx]) {
+            Some(c) => c.1 += 1,
+            None => count.push((keys[idx], 1)),
+        }
+    }
+    let common = count.iter().max_by_key(|c| c.1).map(|c| c.0).unwrap_or([0; 3]);
+    let f = |c: u8| (c as u32 * bright as u32 / 100) as u8;
+    keymap.iter().map(|k| k.map(|i| keys[i as usize]).unwrap_or(common)).map(|c| [f(c[0]), f(c[1]), f(c[2])]).collect()
+}
+
+fn openrgb_apply(index: u32, leds: u16, modes: &[crate::openrgb::OrgbMode], keymap: &[Option<u8>], s: &LedSetting, keys: Option<&[[u8; 3]; KB_LEDS]>) -> Result<(), String> {
+    use crate::openrgb;
+    let find = |name: &str| modes.iter().position(|m| m.name.eq_ignore_ascii_case(name));
+    let direct = modes.iter().any(|m| m.is_direct());
+    match s.mode {
+        MODE_CUSTOM => match keys {
+            Some(k) => openrgb::set_leds(index, &per_led_colors(keymap, k, s.bright)),
+            None => openrgb::set_color(index, leds, scaled(s)),
+        },
+        m if (MODE_ORGB..MODE_CUSTOM).contains(&m) => {
+            let i = (m - MODE_ORGB) as usize;
+            let om = modes.get(i).ok_or("Ese efecto ya no existe en el dispositivo")?;
+            openrgb::set_mode(index, i, om, leds, scaled(s), s.speed, s.multi)
+        }
+        // Estático y apagado: modo directo si existe; si no, el efecto "Static"/"Off" del propio dispositivo.
+        _ if direct => openrgb::set_color(index, leds, scaled(s)),
+        MODE_OFF if find("off").is_some() => {
+            let i = find("off").unwrap();
+            openrgb::set_mode(index, i, &modes[i], leds, (0, 0, 0), 0, false)
+        }
+        _ => match find("static") {
+            Some(i) => openrgb::set_mode(index, i, &modes[i], leds, scaled(s), 0, false),
+            None => openrgb::set_color(index, leds, scaled(s)),
+        },
+    }
+}
+
 // ---------------------------------------------------------------- aplicar luces
 
 /// Datos extra del teclado Tempest: efecto del borde y color de cada tecla.
@@ -322,13 +429,20 @@ pub fn apply(dev: &Device, s: &LedSetting, extra: Option<&Extra>) -> Result<(), 
             Some(Extra::Pad(px)) => crate::nintendo::apply(path, *out_len, *home, px),
             _ => Ok(()),
         },
-        Driver::OpenRgb { index, leds } => crate::openrgb::set_color(*index, *leds, scaled(s)),
-        Driver::LampArray { path } => crate::generic::lamparray_apply(path, scaled(s)),
+        Driver::OpenRgb { index, leds, modes, keymap } => openrgb_apply(*index, *leds, modes, keymap, s, kb_keys(extra)),
+        Driver::LampArray { path } => crate::generic::lamparray_apply(path, s, kb_keys(extra)),
         Driver::None => Err("Este dispositivo no tiene luces controlables".into()),
     }
 }
 
-fn scaled(s: &LedSetting) -> (u8, u8, u8) {
+fn kb_keys(extra: Option<&Extra>) -> Option<&[[u8; 3]; KB_LEDS]> {
+    match extra {
+        Some(Extra::Keyboard(x)) => Some(&x.keys),
+        _ => None,
+    }
+}
+
+pub fn scaled(s: &LedSetting) -> (u8, u8, u8) {
     if s.mode == MODE_OFF {
         return (0, 0, 0);
     }
@@ -830,6 +944,7 @@ fn logitech_probe(i: &HidInfo) -> Vec<Device> {
                 volatile: true,
                 zones: if zones.len() > 1 { names } else { vec![] },
                 pad_extras: false,
+                keymap: false,
             });
             driver = Driver::Logitech { path: i.path.clone(), idx, led_feat: f, zones };
         }
@@ -1174,4 +1289,18 @@ fn bluetooth_batteries() -> Vec<Device> {
         SetupDiDestroyDeviceInfoList(set);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn per_led_colors_follow_keys() {
+        let mut keys = Box::new([[0u8, 0, 200]; KB_LEDS]);
+        keys[56] = [200, 0, 0]; // A
+        // LED 0 = A, LED 1 = logo (no es tecla: toma el color más usado), LED 2 = Esc
+        let c = per_led_colors(&[Some(56), None, Some(1)], &keys, 50);
+        assert_eq!(c, vec![[100, 0, 0], [0, 0, 100], [0, 0, 100]]);
+    }
 }

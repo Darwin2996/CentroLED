@@ -69,7 +69,7 @@ pub fn scan(all: &[HidInfo], handled: &mut HashSet<(u16, u16)>) -> Vec<Device> {
             conn: if i.out_len >= 49 { "Bluetooth" } else { "USB" },
             battery,
             battery_note: "Sin datos (conéctalo por Bluetooth)",
-            led: Some(LedCaps { modes: vec![("LEDs", 1)], speed: false, multicolor: false, volatile: true, zones: vec![], pad_extras: true }),
+            led: Some(LedCaps { modes: vec![("LEDs", 1)], speed: false, multicolor: false, volatile: true, zones: vec![], pad_extras: true, keymap: false }),
             driver: Driver::Switch { path: i.path.clone(), out_len: i.out_len, home: model(i.pid).map(|m| m.1).unwrap_or(false) },
         });
     }
