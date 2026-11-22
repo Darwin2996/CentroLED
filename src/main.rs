@@ -1600,10 +1600,10 @@ fn paint_settings(p: &Painter, x: i32, w: i32) {
     }
     p.text("Aviso de Windows al bajar de ese nivel sin cargar.", &p.rect(x + 20, y + 80, half - 40, 20), th().sub, a.fonts.small, DT_SINGLELINE | DT_END_ELLIPSIS);
     y += 136;
-    card(p, x, y, half, 130, "INICIO");
-    let yy = setting_row(p, x, y + 22, half, "Iniciar con Windows", "", a.autostart || a.config.fast_start, Act::Autostart);
+    card(p, x, y, half, 160, "INICIO");
+    let yy = setting_row(p, x, y + 22, half, "Iniciar con Windows", "Se abre minimizada en segundo plano: sólo el icono de la bandeja.", a.autostart || a.config.fast_start, Act::Autostart);
     setting_row(p, x, yy, half, "Inicio rápido · prioridad alta", "Arranca nada más iniciar sesión, sin la espera que Windows pone a los programas de inicio.", a.config.fast_start, Act::FastStart);
-    y += 170;
+    y += 200;
     let acts = state::hk_actions();
     let hh = 44 + acts.len() as i32 * 52;
     card(p, x, y, half, hh, "ATAJOS DE TECLADO · TAMBIÉN EN SEGUNDO PLANO");
@@ -4124,8 +4124,9 @@ fn main() {
             tries += 1;
         }
         if GetLastError() == ERROR_ALREADY_EXISTS {
+            // Ya está abierta. Si esta copia se lanzó al iniciar (--tray), no sacar la ventana.
             let h = FindWindowW(class.as_ptr(), null());
-            if !h.is_null() {
+            if !h.is_null() && !start_hidden {
                 ShowWindow(h, SW_SHOW);
                 ShowWindow(h, SW_RESTORE);
                 SetForegroundWindow(h);
@@ -4293,6 +4294,10 @@ fn main() {
         state::register_hotkeys();
         if start_hidden {
             hide_to_tray();
+            // Windows puede ignorar el primer ShowWindow si quien la lanzó pidió mostrarla.
+            if IsWindowVisible(hwnd) != 0 {
+                ShowWindow(hwnd, SW_HIDE);
+            }
         } else {
             ShowWindow(hwnd, SW_SHOW);
         }
