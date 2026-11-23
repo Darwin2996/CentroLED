@@ -56,10 +56,14 @@ const TIMER_WIDGET: usize = 6;
 const TIMER_RESUME: usize = 7;
 /// Reintentar el icono de la bandeja si el explorador aún no estaba listo (arranque rápido).
 const TIMER_TRAY: usize = 8;
+/// Búsquedas seguidas al arrancar y tras un fallo al aplicar luces.
+const TIMER_RETRY: usize = 9;
 const WM_UPD_INFO: u32 = WM_APP + 4;
 const WM_UPD_DONE: u32 = WM_APP + 5;
 /// Petición de cierre real (la usa el desinstalador).
 const WM_QUIT_APP: u32 = WM_APP + 9;
+/// Un dispositivo no aceptó las luces al aplicarlas solas (se reintenta en la siguiente búsqueda).
+const WM_APPLY_FAILED: u32 = WM_APP + 10;
 const UNINSTALL_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\CentroLED";
 
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -482,6 +486,9 @@ struct App {
     /// Página del dispositivo: mostrar el historial de batería en vez de las luces.
     show_hist: bool,
     first_scan: bool,
+    /// Búsquedas rápidas que quedan (cada 15 s): al arrancar, para los dispositivos que tardan en
+    /// estar listos (OpenRGB, Bluetooth, cascos), y tras un fallo al aplicar.
+    quick_scans: u8,
 }
 
 /// Widget de batería colocado sobre la barra de tareas de una pantalla secundaria.
@@ -764,6 +771,10 @@ fn start_apply(dev: Device, st: LedSetting, extra: Option<Extra>, silent: bool) 
             let _g = HID_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             devices::apply(&dev, &st, extra.as_ref())
         };
+        if silent && res.is_err() {
+            let key = Box::into_raw(Box::new(dev.key.clone()));
+            unsafe { PostMessageW(hwnd as HWND, WM_APPLY_FAILED, 0, key as LPARAM) };
+        }
         let msg = match res {
             Ok(()) if silent => String::new(),
             Ok(()) => format!("✓ Guardado en {}", dev.name),
@@ -2733,7 +2744,9 @@ fn on_scanned(list: Vec<Device>) {
     if restore {
         save_config(&a.config);
     }
-    a.known = list.iter().map(|d| d.key.clone()).collect();
+    // Sólo cuentan los que ya tenían luces: unos cascos que estaban apagados (sin luces visibles)
+    // reciben su configuración al encenderse.
+    a.known = list.iter().filter(|d| d.led.is_some()).map(|d| d.key.clone()).collect();
     for d in &list {
         if let Some(b) = d.battery {
             a.last_battery.insert(d.key.clone(), b.pct);
@@ -2767,6 +2780,10 @@ fn on_scanned(list: Vec<Device>) {
     update_widgets();
     // Windows crea su ficha del icono un instante después de añadirlo.
     unsafe { SetTimer(a.hwnd, TIMER_PROMOTE, 1500, None) };
+    if a.quick_scans > 0 {
+        a.quick_scans -= 1;
+        unsafe { SetTimer(a.hwnd, TIMER_RETRY, 15_000, None) };
+    }
 }
 
 // ------------------------------------------------------------------ bandeja del sistema e icono
@@ -2974,35 +2991,52 @@ fn secondary_taskbars() -> Vec<HWND> {
     out
 }
 
-/// ¿Hay una aplicación a pantalla completa (p. ej. un juego) en la pantalla de esa barra?
+/// ¿Hay una ventana a pantalla completa (juego, vídeo, navegador con F11…) en la pantalla de esa
+/// barra? Se mira la geometría de las ventanas, no el aviso de Windows (que sólo vale para la
+/// pantalla principal), y da igual que la ventana tenga el foco o no.
 fn fullscreen_on(taskbar: HWND) -> bool {
-    unsafe {
-        // Lo que Windows considera pantalla completa (juegos, vídeo, presentaciones)
-        let mut state: i32 = 0;
-        SHQueryUserNotificationState(&mut state);
-        if !(2..=4).contains(&state) {
-            return false;
+    unsafe extern "system" fn each(h: HWND, lp: LPARAM) -> BOOL {
+        let st = &mut *(lp as *mut (RECT, bool, u32));
+        if IsWindowVisible(h) == 0 || IsIconic(h) != 0 {
+            return 1;
         }
-        let fg = GetForegroundWindow();
-        if fg.is_null() {
-            return false;
+        let ex = GetWindowLongW(h, GWL_EXSTYLE) as u32;
+        if ex & (WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE) != 0 {
+            return 1; // superposiciones (Discord, NVIDIA…) y el propio widget
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(h, &mut pid);
+        if pid == st.2 {
+            return 1;
+        }
+        let mut cloaked: u32 = 0;
+        windows_sys::Win32::Graphics::Dwm::DwmGetWindowAttribute(h, 14 /* DWMWA_CLOAKED */, &mut cloaked as *mut u32 as _, 4);
+        if cloaked != 0 {
+            return 1;
         }
         let mut cls = [0u16; 32];
-        let n = GetClassNameW(fg, cls.as_mut_ptr(), 32) as usize;
+        let n = GetClassNameW(h, cls.as_mut_ptr(), 32) as usize;
         let c = String::from_utf16_lossy(&cls[..n]);
         if c == "Progman" || c == "WorkerW" || c.starts_with("Shell_") {
-            return false;
+            return 1;
         }
+        let mut r: RECT = std::mem::zeroed();
+        GetWindowRect(h, &mut r);
+        let m = st.0;
+        if r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom {
+            st.1 = true;
+            return 0;
+        }
+        1
+    }
+    unsafe {
         let mon = MonitorFromWindow(taskbar, MONITOR_DEFAULTTONEAREST);
-        if MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST) != mon {
-            return false;
-        }
         let mut mi: MONITORINFO = std::mem::zeroed();
         mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
         GetMonitorInfoW(mon, &mut mi);
-        let mut r: RECT = std::mem::zeroed();
-        GetWindowRect(fg, &mut r);
-        r.left <= mi.rcMonitor.left && r.top <= mi.rcMonitor.top && r.right >= mi.rcMonitor.right && r.bottom >= mi.rcMonitor.bottom
+        let mut st = (mi.rcMonitor, false, std::process::id());
+        EnumWindows(Some(each), &mut st as *mut _ as LPARAM);
+        st.1
     }
 }
 
@@ -3669,8 +3703,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 return 0;
             }
-            if wp == TIMER_DEVCHANGE {
-                KillTimer(hwnd, TIMER_DEVCHANGE);
+            if wp == TIMER_DEVCHANGE || wp == TIMER_RETRY {
+                KillTimer(hwnd, wp);
             }
             start_scan();
             0
@@ -3778,6 +3812,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     a.upd = Upd::Error(e.clone());
                     set_status(&format!("No se pudo actualizar: {e}"));
                 }
+            }
+            0
+        }
+        WM_APPLY_FAILED => {
+            let key = *Box::from_raw(lp as *mut String);
+            // El teclado no se reintenta solo (cada escritura desgasta su memoria).
+            if !a.devices.iter().any(|d| d.key == key && is_keyboard(d)) {
+                a.pending.insert(key);
+                a.quick_scans = a.quick_scans.max(4);
+                SetTimer(hwnd, TIMER_RETRY, 15_000, None);
             }
             0
         }
@@ -4234,6 +4278,7 @@ fn main() {
             hist_days: 1,
             show_hist: false,
             first_scan: true,
+            quick_scans: 4,
         });
         APP = Box::into_raw(app_box);
         THEME = make_theme(app().config.theme, app().config.accent, app().config.square);
