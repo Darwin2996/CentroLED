@@ -355,6 +355,7 @@ enum Act {
     Theme(u8),
     Accent(u8),
     Corners(bool),
+    BatteryStyle(u8),
 }
 
 struct Fonts {
@@ -405,6 +406,8 @@ struct Config {
     theme: u8,
     accent: u8,
     square: bool,
+    /// Estilo del icono de batería (BATTERY_STYLES).
+    battery_style: u8,
 }
 
 /// Hilo que funde suavemente los colores del ciclo en un mando.
@@ -513,7 +516,8 @@ enum Upd {
 /// Icono de batería de un dispositivo en el área de notificación.
 struct TrayBatt {
     id: u32,
-    state: (u8, bool, bool),
+    /// Estado dibujado (porcentaje, cargando, último valor) y estilo del icono.
+    state: (u8, bool, bool, u8),
     icon: HICON,
 }
 
@@ -582,6 +586,7 @@ fn load_config() -> Config {
                 "theme" => cfg.theme = f[2].parse().unwrap_or(0),
                 "accent" => cfg.accent = f[2].parse().unwrap_or(0),
                 "corners" => cfg.square = f[2] == "rectas",
+                "battery_icon" => cfg.battery_style = f[2].parse::<u8>().unwrap_or(0).min(BATTERY_STYLES.len() as u8 - 1),
                 _ => {}
             }
         } else if f.len() == 3 && f[0] == "#cycle" {
@@ -653,6 +658,7 @@ fn save_config(cfg: &Config) {
     text += &format!("#opt\ttheme\t{}\n", cfg.theme);
     text += &format!("#opt\taccent\t{}\n", cfg.accent);
     text += &format!("#opt\tcorners\t{}\n", if cfg.square { "rectas" } else { "redondeadas" });
+    text += &format!("#opt\tbattery_icon\t{}\n", cfg.battery_style);
     for p in &cfg.profiles {
         if p.devs.is_empty() {
             text += &format!("#prof\t{}\n", p.name);
@@ -1582,6 +1588,37 @@ fn paint_appearance(p: &Painter, x: i32, y: i32, w: i32) -> i32 {
     y + h + 40
 }
 
+/// Muestras de los estilos del icono de batería (con el fondo de la barra de tareas).
+fn paint_battery_styles(p: &Painter, x: i32, y: i32, w: i32) {
+    let a = app();
+    section(p, "ESTILO DEL ICONO DE BATERÍA", x, y);
+    let n = BATTERY_STYLES.len() as i32;
+    let gap = 10;
+    let tw = (w - gap * (n - 1)) / n;
+    let ty = y + 24;
+    let light = taskbar_light();
+    // Una muestra distinta en cada estilo para ver cómo cambian los colores
+    let samples: [(u8, bool); 5] = [(64, false), (82, false), (15, false), (45, true), (64, false)];
+    for i in 0..n {
+        let tx = x + i * (tw + gap);
+        let act = Act::BatteryStyle(i as u8);
+        let on = a.config.battery_style == i as u8;
+        let r = p.rect(tx, ty, tw, 58);
+        p.fill(&r, if light { rgb(0xEE, 0xEE, 0xF2) } else { rgb(0x1C, 0x1C, 0x22) }, 10);
+        p.stroke(&r, if on { th().accent } else if is_hot(act) { th().sub } else { th().border }, 10, if on { 2 } else { 1 });
+        let size = s(32);
+        let (pct, ch) = samples[i as usize];
+        unsafe {
+            let px = battery_pixels_style(size, pct, ch, false, "\u{E7FC}", i as u8);
+            let icon = pixels_to_icon(size, &px);
+            DrawIconEx(p.dc, (r.left + r.right - size) / 2, (r.top + r.bottom - size) / 2, icon, size, size, 0, null_mut(), DI_NORMAL);
+            DestroyIcon(icon);
+        }
+        p.text(BATTERY_STYLES[i as usize], &p.rect(tx - 4, ty + 63, tw + 8, 18), if on { th().text } else { th().sub }, if on { a.fonts.bold } else { a.fonts.small }, DT_CENTER | DT_SINGLELINE);
+        hit(p.rect(tx, ty, tw, 82), act);
+    }
+}
+
 /// Página de ajustes (se desplaza con la rueda si no cabe).
 fn paint_settings(p: &Painter, x: i32, w: i32) {
     let a = app();
@@ -1600,10 +1637,11 @@ fn paint_settings(p: &Painter, x: i32, w: i32) {
 
     // Columna izquierda
     let mut y = top;
-    card(p, x, y, half, 176, "BARRA DE TAREAS");
+    card(p, x, y, half, 282, "BARRA DE TAREAS");
     let yy = setting_row(p, x, y + 22, half, "Batería junto al reloj", "Un icono por dispositivo con su tipo y porcentaje.", !a.config.hide_tray_battery, Act::TrayBattery);
-    setting_row(p, x, yy, half, "Batería en las otras pantallas", "Windows sólo los pone junto al reloj en la pantalla principal.", !a.config.hide_widget, Act::Widget);
-    y += 216;
+    let yy = setting_row(p, x, yy, half, "Batería en las otras pantallas", "Windows sólo los pone junto al reloj en la pantalla principal.", !a.config.hide_widget, Act::Widget);
+    paint_battery_styles(p, x + 20, yy + 4, half - 40);
+    y += 322;
     card(p, x, y, half, 96, "AVISO DE BATERÍA BAJA");
     let mut cx = x + 20;
     for (label, v) in [("No", 0u8), ("10 %", 10), ("15 %", 15), ("20 %", 20), ("30 %", 30)] {
@@ -2544,6 +2582,13 @@ fn on_click(act: Act, x: i32) {
             save_config(&a.config);
             apply_theme();
         }
+        Act::BatteryStyle(i) => {
+            a.config.battery_style = i;
+            save_config(&a.config);
+            update_battery_icons();
+            update_widgets();
+            redraw();
+        }
         Act::Widget => {
             a.config.hide_widget = !a.config.hide_widget;
             save_config(&a.config);
@@ -2922,12 +2967,35 @@ fn taskbar_light() -> bool {
     }
 }
 
+/// Estilos del icono de batería que se pueden elegir en Ajustes.
+const BATTERY_STYLES: [&str; 5] = ["Clásico", "Pila", "Número", "Anillo", "Barra"];
+
 unsafe fn make_battery_icon(size: i32, pct: u8, charging: bool, stale: bool, glyph: &str) -> HICON {
     pixels_to_icon(size, &battery_pixels(size, pct, charging, stale, glyph))
 }
 
+/// Color del nivel: verde, ámbar o rojo (gris si es el último valor conocido).
+fn level_color(pct: u8, stale: bool) -> u32 {
+    if stale {
+        rgb(0x55, 0x55, 0x60)
+    } else if pct > 50 {
+        rgb(0x23, 0xA8, 0x5E)
+    } else if pct > 20 {
+        rgb(0xD4, 0x88, 0x0C)
+    } else {
+        rgb(0xD9, 0x3A, 0x3F)
+    }
+}
+
 unsafe fn battery_pixels(size: i32, pct: u8, charging: bool, stale: bool, glyph: &str) -> Vec<u32> {
+    battery_pixels_style(size, pct, charging, stale, glyph, app().config.battery_style)
+}
+
+unsafe fn battery_pixels_style(size: i32, pct: u8, charging: bool, stale: bool, glyph: &str, style: u8) -> Vec<u32> {
     let light = taskbar_light();
+    if style > 0 {
+        return render_pixels(size, |dc, s| battery_style_draw(dc, s, pct.min(100), charging, stale, glyph, style, light));
+    }
     render_pixels(size, |dc, s| {
         let u = |f: f32| (f * s as f32).round() as i32;
         let white = match (light, stale) {
@@ -2957,6 +3025,91 @@ unsafe fn battery_pixels(size: i32, pct: u8, charging: bool, stale: bool, glyph:
         let wdt = if text.len() >= 3 { ((inner.right - inner.left) as f32 / 3.4) as i32 } else { 0 };
         gdi_text(dc, &text, inner, "Segoe UI", (h * 1.05) as i32, wdt, 800, rgb(0xFF, 0xFF, 0xFF));
     })
+}
+
+/// Dibuja los estilos alternativos del icono (el clásico está en battery_pixels_style).
+unsafe fn battery_style_draw(dc: HDC, s: i32, pct: u8, charging: bool, stale: bool, glyph: &str, style: u8, light: bool) {
+    let u = |f: f32| (f * s as f32).round() as i32;
+    let fg = match (light, stale) {
+        (false, false) => rgb(0xFF, 0xFF, 0xFF),
+        (false, true) => rgb(0xA8, 0xA8, 0xB4),
+        (true, false) => rgb(0x1A, 0x1A, 0x1A),
+        (true, true) => rgb(0x70, 0x70, 0x78),
+    };
+    let level = level_color(pct, stale);
+    let charge = rgb(0xFF, 0xD3, 0x3D);
+    let text = pct.to_string();
+    match style {
+        // Pila grande que ocupa todo el icono, con el porcentaje dentro
+        1 => {
+            let body = RECT { left: u(0.02), top: u(0.18), right: s - u(0.12), bottom: s - u(0.18) };
+            let outline = if charging { charge } else { fg };
+            gdi_round(dc, RECT { left: body.right - u(0.02), top: u(0.38), right: s - u(0.01), bottom: s - u(0.38) }, u(0.06), Some(outline), None);
+            gdi_round(dc, body, u(0.16), Some(outline), None);
+            let line = u(0.07).max(2);
+            let inner = RECT { left: body.left + line, top: body.top + line, right: body.right - line, bottom: body.bottom - line };
+            gdi_round(dc, inner, u(0.11), Some(rgb(0x1C, 0x1C, 0x24)), None);
+            let fw = ((inner.right - inner.left) as f32 * pct as f32 / 100.0).round() as i32;
+            if fw > 0 {
+                gdi_round(dc, RECT { right: inner.left + fw.max(line), ..inner }, u(0.09), Some(level), None);
+            }
+            let h = (inner.bottom - inner.top) as f32;
+            let wdt = if text.len() >= 3 { ((inner.right - inner.left) as f32 / 3.3) as i32 } else { 0 };
+            gdi_text(dc, &text, inner, "Segoe UI", (h * 1.0) as i32, wdt, 800, rgb(0xFF, 0xFF, 0xFF));
+        }
+        // Sólo el número, del color del nivel (amarillo al cargar)
+        2 => {
+            let c = if charging { charge } else if stale { fg } else if pct > 20 { fg } else { level };
+            let wdt = if text.len() >= 3 { (s as f32 / 3.2) as i32 } else { (s as f32 / 2.3) as i32 };
+            gdi_text(dc, &text, RECT { left: 0, top: 0, right: s, bottom: s }, "Segoe UI", u(0.86), wdt, 800, c);
+            // Raya del nivel debajo
+            let w = ((s - u(0.16)) as f32 * pct as f32 / 100.0).round() as i32;
+            gdi_round(dc, RECT { left: u(0.08), top: s - u(0.12), right: s - u(0.08), bottom: s - u(0.02) }, u(0.06), Some(rgb(0x3A, 0x3A, 0x44)), None);
+            if w > 0 {
+                gdi_round(dc, RECT { left: u(0.08), top: s - u(0.12), right: u(0.08) + w.max(u(0.1)), bottom: s - u(0.02) }, u(0.06), Some(if charging { charge } else { level }), None);
+            }
+        }
+        // Anillo que se llena en el sentido del reloj, con el número dentro
+        3 => {
+            let th = u(0.15);
+            let r = RECT { left: th / 2 + u(0.02), top: th / 2 + u(0.02), right: s - th / 2 - u(0.02), bottom: s - th / 2 - u(0.02) };
+            let ring = |c: u32, from: f32, to: f32| {
+                let pen = CreatePen(PS_SOLID, th, c);
+                let op = SelectObject(dc, pen);
+                let ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+                let (cx, cy) = ((r.left + r.right) as f32 / 2.0, (r.top + r.bottom) as f32 / 2.0);
+                let pt = |a: f32| {
+                    let a = (a - 0.25) * std::f32::consts::TAU; // 0 = arriba
+                    ((cx + a.cos() * s as f32) as i32, (cy + a.sin() * s as f32) as i32)
+                };
+                if to - from >= 0.999 {
+                    Ellipse(dc, r.left, r.top, r.right, r.bottom);
+                } else if to > from {
+                    SetArcDirection(dc, AD_CLOCKWISE);
+                    let (a, b) = (pt(from), pt(to));
+                    Arc(dc, r.left, r.top, r.right, r.bottom, a.0, a.1, b.0, b.1);
+                }
+                SelectObject(dc, op);
+                SelectObject(dc, ob);
+                DeleteObject(pen);
+            };
+            ring(if light { rgb(0xC8, 0xC8, 0xD0) } else { rgb(0x3A, 0x3A, 0x44) }, 0.0, 1.0);
+            ring(if charging { charge } else { level }, 0.0, pct as f32 / 100.0);
+            let inner = RECT { left: th, top: th, right: s - th, bottom: s - th };
+            let wdt = if text.len() >= 3 { ((inner.right - inner.left) as f32 / 3.4) as i32 } else { 0 };
+            gdi_text(dc, &text, inner, "Segoe UI", u(0.44), wdt, 800, fg);
+        }
+        // Dibujo del dispositivo grande con una barra de nivel debajo
+        _ => {
+            gdi_text(dc, glyph, RECT { left: 0, top: 0, right: s, bottom: u(0.74) }, "Segoe Fluent Icons", u(0.66), 0, 400, fg);
+            let bar = RECT { left: u(0.04), top: u(0.78), right: s - u(0.04), bottom: s - u(0.02) };
+            gdi_round(dc, bar, u(0.2), Some(if light { rgb(0xC8, 0xC8, 0xD0) } else { rgb(0x3A, 0x3A, 0x44) }), None);
+            let w = ((bar.right - bar.left) as f32 * pct as f32 / 100.0).round() as i32;
+            if w > 0 {
+                gdi_round(dc, RECT { right: bar.left + w.max(u(0.2)), ..bar }, u(0.2), Some(if charging { charge } else { level }), None);
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------------------ widget en pantallas secundarias
@@ -3108,7 +3261,7 @@ fn update_widgets_inner() {
             }
             let width = items.len() as i32 * item + sc(8);
             let x = tr.right - sc(a.config.widget_offset) - width;
-            let sig = format!("{:?}{}{}{}{}", items, tr.left, tr.top, tr.right, a.config.widget_offset);
+            let sig = format!("{:?}{}{}{}{}{}", items, tr.left, tr.top, tr.right, a.config.widget_offset, a.config.battery_style);
             if sig != w.sig {
                 render_widget(w, &items, x, tr.top, width, h, icon, item, sc(4), sc(5));
                 w.sig = sig;
@@ -3253,9 +3406,10 @@ fn update_battery_icons() {
     }
     // Añadir o actualizar
     for (key, tip, state, g) in wanted {
+        let drawn = (state.0, state.1, state.2, a.config.battery_style);
         let existing = a.tray_batt.get(&key).map(|t| (t.id, t.state));
         let (id, add) = match existing {
-            Some((id, st)) if st == state => {
+            Some((id, st)) if st == drawn => {
                 tray_set(id, None, &tip, false);
                 continue;
             }
@@ -3267,7 +3421,7 @@ fn update_battery_icons() {
         };
         let icon = unsafe { make_battery_icon(size, state.0, state.1, state.2, g) };
         tray_set(id, Some(icon), &tip, add);
-        if let Some(old) = a.tray_batt.insert(key, TrayBatt { id, state, icon }) {
+        if let Some(old) = a.tray_batt.insert(key, TrayBatt { id, state: drawn, icon }) {
             unsafe { DestroyIcon(old.icon) };
         }
     }
@@ -4006,6 +4160,10 @@ unsafe fn render_to_file(w: i32, h: i32, path: &str, draw: impl FnOnce(HDC)) {
 unsafe fn do_render(args: &[String]) {
     let a = app();
     if args[1] == "--render-icons" {
+        // Estilo opcional: --render-icons salida.bmp <estilo>
+        if let Some(st) = args.get(3).and_then(|v| v.parse::<u8>().ok()) {
+            a.config.battery_style = st.min(BATTERY_STYLES.len() as u8 - 1);
+        }
         let samples: [(u8, bool, bool, &str); 5] = [(100, true, false, "\u{E7FC}"), (64, false, false, "\u{E7F6}"), (15, false, false, "\u{E962}"), (45, false, true, "\u{E765}"), (8, false, false, "\u{E702}")];
         let sizes = [16, 20, 24, 32, 48];
         let cell = 60;
