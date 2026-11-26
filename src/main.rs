@@ -2484,7 +2484,12 @@ fn paint_battery_only(p: &Painter, d: &Device, x: i32, w: i32) {
         None => {
             p.text(&battery_text(d), &p.rect(x + 140, 134, w - 170, 40), th().text, a.fonts.h2, DT_SINGLELINE | DT_VCENTER);
             if d.led.is_none() {
-                p.text("Este dispositivo no tiene luces configurables.", &p.rect(x + 140, 180, w - 170, 22), th().sub, a.fonts.body, DT_SINGLELINE);
+                let msg = if d.key == "krom-kernel-tkl" {
+                    "Sus luces se cambian con los atajos Fn del propio teclado; Krom no permite controlarlas desde el PC."
+                } else {
+                    "Este dispositivo no tiene luces configurables."
+                };
+                p.text(msg, &p.rect(x + 140, 180, w - 170, 90), th().sub, a.fonts.body, DT_WORDBREAK);
             }
         }
     }

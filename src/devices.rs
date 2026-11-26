@@ -133,6 +133,22 @@ pub fn scan() -> Vec<Device> {
         });
     }
 
+    // Teclado Krom Kernel TKL (Sonix 0C45:8508): sin programa oficial, las luces sólo se
+    // cambian con atajos del propio teclado. Se muestra para que el usuario sepa que se ha detectado.
+    if let Some(i) = all.iter().find(|i| i.vid == 0x0C45 && i.pid == 0x8508) {
+        handled.insert((i.vid, i.pid));
+        out.push(Device {
+            key: "krom-kernel-tkl".into(),
+            name: "Teclado Krom Kernel TKL".into(),
+            kind: "Teclado",
+            conn: "USB",
+            battery: None,
+            battery_note: "Con cable",
+            led: None,
+            driver: Driver::None,
+        });
+    }
+
     // Mandos PlayStation
     for i in all.iter().filter(|i| i.vid == 0x054C && i.usage_page == 1 && i.usage == 5) {
         let ds5 = matches!(i.pid, 0x0CE6 | 0x0DF2);

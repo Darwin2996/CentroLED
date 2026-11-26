@@ -7,6 +7,7 @@ App nativa de Windows (Rust + Win32, ~750 KB) para controlar las luces y ver la 
 | Dispositivo | Batería | Luces |
 |---|---|---|
 | Teclado Tempest Diablo (0C45:8006) | — (con cable) | Teclas: 19 efectos o color libre tecla a tecla. Borde: 6 efectos propios con su color. Brillo, velocidad, arcoíris. Se guarda en el teclado |
+| Teclado Krom Kernel TKL (0C45:8508) | — (con cable) | Se detecta, pero sus luces sólo se cambian con los atajos Fn del teclado (Krom no tiene programa para PC) |
 | Mando DualSense / DualSense Edge (USB y Bluetooth) | Sí | Barra de luz: estático, respiración, **ciclo suave** entre 2–8 colores, arcoíris o apagada. LEDs de jugador (5, con brillo) y LED del micrófono (apagado/encendido/parpadeo) |
 | Mando DualShock 4 | Sí | Barra de luz (mismos efectos) |
 | Logitech HID++ (G733 y otros cascos/ratones/teclados) | Sí | Cada zona de luz por separado (p. ej. las dos luces del G733) con los efectos que admita el dispositivo: estático, respiración, pulso, ciclo de color, ondas… |
